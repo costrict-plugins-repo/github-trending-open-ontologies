@@ -1,0 +1,1557 @@
+use std::collections::BTreeSet;
+use std::io::Cursor;
+use std::path::Path;
+
+use oxigraph::io::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
+use oxigraph::model::*;
+use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::store::Store;
+
+/// A document's quads and the namespace prefixes it declared, in order.
+pub type ParsedDocument = (Vec<Quad>, Vec<(String, String)>);
+
+/// How a document is serialised: one of the RDF formats Oxigraph parses, or
+/// OWL 2 functional syntax, which is not RDF and is read by [`crate::ofn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceFormat {
+    Rdf(RdfFormat),
+    OwlFunctional,
+}
+
+/// What a parse produced. `statements` counts parser events; `triples` counts
+/// distinct triples, which is the size of the resulting graph. They differ
+/// whenever the source repeats a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationCounts {
+    pub statements: usize,
+    pub triples: usize,
+}
+
+/// The graphs one run may read.
+///
+/// Until #108 every verdict-producing path in this engine read the WHOLE
+/// store and had no vocabulary for saying so. The reasoner read it through
+/// [`GraphStore::all_triples`], which iterates every quad and drops the graph
+/// name; the SHACL validator read it through
+/// [`GraphStore::sparql_select_union`], which makes the default graph the
+/// union of every graph. On a single-version store those are the same set and
+/// the right one. On a store that keeps one entity's versions in one named
+/// graph each, they are a union of states that held at no instant, and a
+/// verdict over that union is neither what was true then nor what is true now.
+///
+/// The failure is invisible to every gate this project has, which is why it
+/// needed a type rather than a flag. A derivation certificate is a claim about
+/// the graph in `asserted.tsv`, and the Lean checker verifies exactly that
+/// claim; if the triples in `asserted.tsv` were selected by a scope nobody
+/// chose, the certificate is valid and the answer is wrong. Making the scope a
+/// value means a run can RECORD what it read, and a reader can audit the scope
+/// instead of assuming it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadScope {
+    /// The default graph and every named graph. The historical behaviour, and
+    /// what a store with no versioning means.
+    AllGraphs,
+    /// Exactly these graphs. `default_graph` says whether the store's default
+    /// graph is one of them; `named` lists the named graphs, in the order they
+    /// are to be read.
+    Graphs {
+        default_graph: bool,
+        named: Vec<String>,
+    },
+}
+
+impl ReadScope {
+    /// The graph names this scope admits, for a certificate to record.
+    ///
+    /// A certificate that does not say which graphs it read cannot be checked
+    /// against the store it claims to be about, so both reading paths report
+    /// this: the one that excludes named graphs by name, and this one, which
+    /// names the set it selected.
+    pub fn graphs_read(&self) -> Vec<String> {
+        match self {
+            ReadScope::AllGraphs => vec!["(every graph in the store)".to_string()],
+            ReadScope::Graphs { default_graph, named } => {
+                let mut v = Vec::with_capacity(named.len() + 1);
+                if *default_graph {
+                    v.push("(default graph)".to_string());
+                }
+                v.extend(named.iter().cloned());
+                v
+            }
+        }
+    }
+
+    /// True when this scope is the whole store.
+    pub fn is_all_graphs(&self) -> bool {
+        matches!(self, ReadScope::AllGraphs)
+    }
+
+    /// Point a prepared query's dataset at exactly this scope.
+    ///
+    /// Both halves matter. `set_default_graph` is what an UNGUARDED pattern
+    /// reads, which is every pattern the SHACL validator emits. Restricting
+    /// the available NAMED graphs to the same set is what stops a `GRAPH`
+    /// block a caller wrote — in a `sh:sparql` constraint, say — from reaching
+    /// a graph the scope excluded.
+    fn apply(
+        &self,
+        dataset: &mut oxigraph::sparql::QueryDatasetSpecification,
+    ) -> anyhow::Result<()> {
+        match self {
+            ReadScope::AllGraphs => dataset.set_default_graph_as_union(),
+            ReadScope::Graphs {
+                default_graph,
+                named,
+            } => {
+                let mut names: Vec<GraphName> = Vec::with_capacity(named.len() + 1);
+                if *default_graph {
+                    names.push(GraphName::DefaultGraph);
+                }
+                let mut available: Vec<NamedOrBlankNode> = Vec::with_capacity(named.len());
+                for g in named {
+                    let node =
+                        NamedNode::new(g).map_err(|e| anyhow::anyhow!("{g} is not an IRI: {e}"))?;
+                    names.push(GraphName::NamedNode(node.clone()));
+                    available.push(NamedOrBlankNode::NamedNode(node));
+                }
+                dataset.set_default_graph(names);
+                dataset.set_available_named_graphs(available);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Optional HTTP authentication for remote SPARQL endpoints.
+///
+/// Enterprise triple stores gate their SPARQL Protocol endpoints behind auth:
+/// Stardog and Ontotext GraphDB accept HTTP Basic; token-secured deployments
+/// accept a Bearer token. Open stores (Apache Jena/Fuseki, Eclipse RDF4J,
+/// public Virtuoso) need none — leave this empty.
+#[derive(Default, Clone)]
+pub struct SparqlAuth {
+    /// HTTP Basic credentials as (username, password).
+    pub basic: Option<(String, String)>,
+    /// Bearer token (takes precedence over `basic` if both are set).
+    pub bearer: Option<String>,
+}
+
+impl SparqlAuth {
+    /// Build from optional username/password/token (e.g. tool inputs).
+    /// Returns a no-auth value when all are absent.
+    pub fn from_parts(
+        username: Option<String>,
+        password: Option<String>,
+        token: Option<String>,
+    ) -> Self {
+        let basic = match (username, password) {
+            (Some(u), Some(p)) => Some((u, p)),
+            (Some(u), None) => Some((u, String::new())),
+            _ => None,
+        };
+        SparqlAuth { basic, bearer: token }
+    }
+
+    /// Apply the configured auth to a request builder.
+    fn apply(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(t) = &self.bearer {
+            rb.bearer_auth(t)
+        } else if let Some((u, p)) = &self.basic {
+            rb.basic_auth(u, Some(p))
+        } else {
+            rb
+        }
+    }
+}
+
+/// What [`GraphStore::triples_outside`] returns: the triples, and the names of
+/// the graphs they came from.
+///
+/// The second half is not decoration. A certificate that says which graphs its
+/// assertions came from can be checked against the store; one that does not
+/// cannot, and `asserted.tsv` has no column that says "derived". See TCB-8 in
+/// `docs/trusted-computing-base.md`.
+pub type AssertedTriples = (Vec<(String, String, String)>, Vec<String>);
+
+/// In-memory RDF graph store backed by Oxigraph.
+///
+/// The store is held directly rather than behind a `Mutex`. Oxigraph's `Store`
+/// is already `Send + Sync` and synchronises internally, so the mutex added
+/// nothing but serialisation: every SPARQL read across all the tools queued
+/// behind one lock even though the reads do not conflict. It also meant
+/// fourteen `lock().unwrap()` sites, each of which turned a panic anywhere in
+/// the process into a poisoned lock and a second panic in every later request.
+pub struct GraphStore {
+    store: Store,
+}
+
+/// Why [`GraphStore::canonicalize_pair`] compared only ground triples.
+///
+/// Diff and drift attach this to their reports. It is returned alongside the
+/// stores rather than logged so that a caller cannot present the cut as an
+/// exact comparison without dropping a value it was handed.
+#[derive(Debug, Clone)]
+pub struct Approximation {
+    /// The RDFC-1.0 budget error from the snapshot that exhausted it.
+    pub reason: String,
+    /// Quads mentioning a blank node that were left out of the old snapshot.
+    pub omitted_old: usize,
+    /// The same count for the new snapshot.
+    pub omitted_new: usize,
+}
+
+impl Default for GraphStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GraphStore {
+    pub fn new() -> Self {
+        Self {
+            store: Store::new().expect("Failed to create Oxigraph store"),
+        }
+    }
+
+    /// Open a RocksDB-backed persistent store at `path`, creating it if missing.
+    ///
+    /// Oxigraph allows only one read-write handle per directory; opening the
+    /// same path from a second process will fail. Sandbox stores throughout
+    /// the codebase keep using [`GraphStore::new`] — only the main graph
+    /// should ever be persistent.
+    pub fn open_persistent(path: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create persistent triplestore directory {}: {e}",
+                path.display()
+            )
+        })?;
+        let store = Store::open(path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open persistent Oxigraph store at {}: {e}",
+                path.display()
+            )
+        })?;
+        Ok(Self { store })
+    }
+
+    pub fn triple_count(&self) -> usize {
+        let store = &self.store;
+        store.len().unwrap_or(0)
+    }
+
+    pub fn load_turtle(&self, ttl: &str, base_iri: Option<&str>) -> anyhow::Result<usize> {
+        let store = &self.store;
+        let reader = Cursor::new(ttl.as_bytes());
+        let mut parser = RdfParser::from_format(RdfFormat::Turtle);
+        if let Some(base) = base_iri {
+            parser = parser.with_base_iri(base)?;
+        }
+        // Parse the whole document BEFORE touching the store. Streaming
+        // inserts left every quad before the first syntax error in place, so
+        // a failed load produced a silently partial graph that looked exactly
+        // like a small one (issue #93). All or nothing.
+        let quads: Vec<_> = parser
+            .for_reader(reader)
+            .collect::<Result<_, _>>()?;
+        // Report triples actually added, not parse events. The store is a set, so
+        // re-inserting a statement it already holds changes nothing and must not be
+        // counted as a load.
+        let before = store.len().unwrap_or(0);
+        // One transaction for the whole document, so a concurrent reader
+        // sees the store before this load or after it and never part way
+        // through. Parsing already happened above, which made a load
+        // all-or-nothing against a SYNTAX error (#93). It was not
+        // all-or-nothing against a concurrent READ: the inserts ran one at a
+        // time, so another session walking the store could capture a
+        // half-loaded ontology, and a certified session would then write an
+        // asserted.tsv describing it. Measured in
+        // tests/store_atomicity_test.rs. serve-http and daemon share one
+        // Arc<GraphStore> across every session, so the second party is not
+        // hypothetical.
+        let mut txn = store.start_transaction()?;
+        for quad in &quads {
+            txn.insert(quad);
+        }
+        txn.commit()?;
+        Ok(store.len().unwrap_or(before).saturating_sub(before))
+    }
+
+    /// Load RDF content in a specified format (Turtle, RDF/XML, etc.)
+    pub fn load_content(&self, content: &str, format: RdfFormat) -> anyhow::Result<usize> {
+        self.load_content_with_base(content, format, None)
+    }
+
+    /// Load RDF content with an optional base IRI for resolving relative IRIs.
+    pub fn load_content_with_base(
+        &self,
+        content: &str,
+        format: RdfFormat,
+        base_iri: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        self.load_content_with_base_mode(content, format, base_iri, false)
+    }
+
+    fn load_content_with_base_mode(
+        &self,
+        content: &str,
+        format: RdfFormat,
+        base_iri: Option<&str>,
+        replace: bool,
+    ) -> anyhow::Result<usize> {
+        let reader = Cursor::new(content.as_bytes());
+        let mut parser = RdfParser::from_format(format);
+        if let Some(base) = base_iri {
+            parser = parser.with_base_iri(base)?;
+        }
+        // All or nothing: see load_turtle (issue #93).
+        let quads: Vec<_> = parser.for_reader(reader).collect::<Result<_, _>>()?;
+        self.store_parsed_quads(&quads, replace)
+    }
+
+    pub fn load_file(&self, path: &str) -> anyhow::Result<usize> {
+        self.load_file_mode(path, false)
+    }
+
+    /// Replace the active dataset only after the entire source parses.
+    pub(crate) fn replace_file(&self, path: &str) -> anyhow::Result<usize> {
+        self.load_file_mode(path, true)
+    }
+
+    /// Replace from a cache or eviction snapshot without partial publication.
+    pub(crate) fn replace_nquads(&self, content: &str) -> anyhow::Result<usize> {
+        self.load_content_with_base_mode(content, RdfFormat::NQuads, None, true)
+    }
+
+    fn load_file_mode(&self, path: &str, replace: bool) -> anyhow::Result<usize> {
+        let content = std::fs::read_to_string(path)?;
+        // All or nothing: see load_turtle (issue #93).
+        let quads = Self::parse_document(path, &content)?;
+        self.store_parsed_quads(&quads, replace)
+    }
+
+    /// A file's quads, as parsed and never stored, with the namespace
+    /// prefixes it declared, in the order it declared them.
+    ///
+    /// A store holds no prefixes, and it also normalises some literals, so a
+    /// writer that must give back exactly the document's graph, abbreviated
+    /// with the document's own names, reads the document here. The OWL
+    /// functional-syntax writer (issue #322) is that writer.
+    pub fn read_file_with_prefixes(
+        path: &str,
+    ) -> anyhow::Result<ParsedDocument> {
+        let content = std::fs::read_to_string(path)?;
+        Self::parse_document_with_prefixes(path, &content)
+    }
+
+    /// Parse a whole document, whatever it is serialised as, into quads.
+    ///
+    /// Every path that reads a FILE goes through here (`load_file`,
+    /// `replace_file`, `validate_file`, `content_as_turtle`), so a format this
+    /// engine learns to read is learned once and reaches the CLI, `batch`, the
+    /// MCP tools and the compile cache together. Before the OWL functional
+    /// syntax reader existed each of those called the RDF parser directly, and
+    /// adding a format meant finding all of them.
+    fn parse_document(path: &str, content: &str) -> anyhow::Result<Vec<Quad>> {
+        Ok(Self::parse_document_with_prefixes(path, content)?.0)
+    }
+
+    /// [`Self::parse_document`], keeping the prefixes the parser saw.
+    fn parse_document_with_prefixes(
+        path: &str,
+        content: &str,
+    ) -> anyhow::Result<ParsedDocument> {
+        match Self::detect_source_format(path, content) {
+            SourceFormat::OwlFunctional => Ok((
+                crate::ofn::parse(content)?
+                    .into_iter()
+                    .map(|t| t.in_graph(GraphName::DefaultGraph))
+                    .collect(),
+                crate::ofn::declared_prefixes(content),
+            )),
+            SourceFormat::Rdf(format) => {
+                // A document's own location is its default base, per RFC 3986.
+                // Without it, any file using relative IRIs fails to parse at
+                // all, which is most published RDF/XML: LUBM's generated data
+                // would not load a single triple before this. OFN needs none:
+                // its grammar admits only absolute IRIs.
+                let mut parser = RdfParser::from_format(format);
+                if let Some(base) = Self::file_base_iri(path) {
+                    parser = parser.with_base_iri(base)?;
+                }
+                let mut reader = parser.for_reader(Cursor::new(content.as_bytes()));
+                let mut quads = Vec::new();
+                for quad in &mut reader {
+                    quads.push(quad?);
+                }
+                let prefixes = reader
+                    .prefixes()
+                    .map(|(name, iri)| (name.to_string(), iri.to_string()))
+                    .collect();
+                Ok((quads, prefixes))
+            }
+        }
+    }
+
+    fn store_parsed_quads(&self, quads: &[Quad], replace: bool) -> anyhow::Result<usize> {
+        let before = if replace {
+            0
+        } else {
+            self.store.len().unwrap_or(0)
+        };
+        let mut txn = self.store.start_transaction()?;
+        if replace {
+            // Clear and insert share one transaction: failed parsing never clears
+            // the old graph, and readers cannot observe an empty intermediate graph.
+            txn.clear()?;
+        }
+        for quad in quads {
+            txn.insert(quad);
+        }
+        txn.commit()?;
+        Ok(self.store.len().unwrap_or(before).saturating_sub(before))
+    }
+    pub fn save_file(&self, path: &str, format: &str) -> anyhow::Result<()> {
+        let content = self.serialize(format)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    pub fn validate_turtle(ttl: &str) -> anyhow::Result<ValidationCounts> {
+        let reader = Cursor::new(ttl.as_bytes());
+        let parser = RdfParser::from_format(RdfFormat::Turtle).for_reader(reader);
+        Self::count_parsed(parser)
+    }
+
+    /// Read a file and hand back Turtle, whatever it was serialised as.
+    ///
+    /// `validate` has always sniffed the format; `lint` read the bytes and
+    /// handed them to a Turtle parser, so it failed on every RDF/XML document
+    /// with a parse error from the wrong parser. Since OBO Foundry publishes
+    /// RDF/XML, that made `lint` unusable on 62 of the 64 real ontologies in a
+    /// census of the most-declared vocabularies in the public metabolomics
+    /// record. Both commands now share this.
+    pub fn read_as_turtle(path: &str) -> anyhow::Result<String> {
+        let content = std::fs::read_to_string(path)?;
+        Self::content_as_turtle(path, content)
+    }
+
+    /// As `read_as_turtle`, for content already in hand (stdin, for instance).
+    pub fn content_as_turtle(path_hint: &str, content: String) -> anyhow::Result<String> {
+        let format = Self::detect_source_format(path_hint, &content);
+        if format == SourceFormat::Rdf(RdfFormat::Turtle) {
+            if let Some(base) = Self::file_base_iri(path_hint) {
+                // Keep the default base on the first source line so downstream
+                // parsers report the document's original line numbers. A later
+                // @base still overrides it; only first-line columns gain the prefix.
+                return Ok(format!("@base <{base}> . {content}"));
+            }
+            return Ok(content);
+        }
+        let store = Self::new();
+        {
+            let inner = &store.store;
+            let quads = Self::parse_document(path_hint, &content)?;
+            for quad in &quads {
+                inner.insert(quad)?;
+            }
+        }
+        store.serialize("turtle")
+    }
+
+    pub fn validate_file(path: &str) -> anyhow::Result<ValidationCounts> {
+        let content = std::fs::read_to_string(path)?;
+        if let SourceFormat::Rdf(format) = Self::detect_source_format(path, &content) {
+            let reader = Cursor::new(content.as_bytes());
+            let mut parser = RdfParser::from_format(format);
+            if let Some(base) = Self::file_base_iri(path) {
+                parser = parser.with_base_iri(base)?;
+            }
+            return Self::count_parsed(parser.for_reader(reader));
+        }
+        Self::count_ofn(&content)
+    }
+
+    /// Validate text handed over without a file name: the CLI's `validate -`
+    /// and `onto_validate` with `inline: true`. Both used to go straight to
+    /// the Turtle parser, which is right for everything they were written for
+    /// and wrong for an OWL functional-syntax document, which no Turtle parser
+    /// can read. With no extension to go on, the content decides.
+    pub fn validate_text(content: &str) -> anyhow::Result<ValidationCounts> {
+        if crate::ofn::looks_like_ofn(content) {
+            return Self::count_ofn(content);
+        }
+        Self::validate_turtle(content)
+    }
+
+    fn count_ofn(content: &str) -> anyhow::Result<ValidationCounts> {
+        Self::count_parsed(
+            crate::ofn::parse(content)?
+                .into_iter()
+                .map(|t| Ok::<_, oxigraph::io::RdfParseError>(t.in_graph(GraphName::DefaultGraph))),
+        )
+    }
+
+    /// A local document's default base is its encoded file URL. Building this
+    /// by concatenation treats filename characters such as spaces, `#` and `%`
+    /// as URI syntax instead of part of the path.
+    fn file_base_iri(path: &str) -> Option<String> {
+        let absolute = std::fs::canonicalize(path).ok()?;
+        reqwest::Url::from_file_path(absolute).ok().map(Into::into)
+    }
+
+    /// Count what a parser produced, distinguishing statements from triples.
+    ///
+    /// An RDF graph is a set, so a statement repeated in the source contributes
+    /// one triple and not two. Reporting the parse-event count as a triple count
+    /// overstates any generated document that repeats a statement, which real
+    /// serialisers do constantly: emitting `?lib a :Library` once per record is
+    /// ordinary practice and inflated one 16.7 MB file by 6.7 per cent.
+    fn count_parsed<I>(parser: I) -> anyhow::Result<ValidationCounts>
+    where
+        I: IntoIterator<Item = Result<Quad, oxigraph::io::RdfParseError>>,
+    {
+        let mut statements = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        for quad in parser {
+            let quad = quad?;
+            statements += 1;
+            seen.insert(quad);
+        }
+        Ok(ValidationCounts {
+            statements,
+            triples: seen.len(),
+        })
+    }
+
+    /// Run a SELECT over the store's default graph.
+    ///
+    /// **Which of the two you want depends on who wrote the query.** A query
+    /// someone typed belongs here: they chose the dataset by writing `GRAPH`
+    /// or not writing it, and widening it under them would change the meaning
+    /// of what they wrote. A query this codebase authored to ask a question
+    /// about the store belongs in [`Self::sparql_select_union`], because the
+    /// answer to "what does this store declare" or "which instances are
+    /// there" must not depend on the file format the triples arrived in.
+    ///
+    /// Getting that backwards does not look like a bug. It looks like a clean
+    /// report over a store that holds nothing, which is how it survived in
+    /// four separate tools at once (#108). `tests/serialisation_invariance_test.rs`
+    /// is where a tool's answer is pinned against both serialisations.
+    pub fn sparql_select(&self, query: &str) -> anyhow::Result<String> {
+        self.select_with_dataset(query, false)
+    }
+
+    /// Run a SELECT whose default graph is the union of every graph in the
+    /// store, named graphs included.
+    ///
+    /// The plain `sparql_select` leaves the evaluator on its default dataset
+    /// specification, which is the store's default graph alone. That is the
+    /// right dataset for a query someone wrote, since a caller who wants a
+    /// named graph writes `GRAPH`. It is the wrong one for a tool that asks a
+    /// question about the store rather than about a graph, because the answer
+    /// then depends on which serialisation the data arrived in: the same
+    /// triples loaded from Turtle are visible and loaded from TriG are not.
+    ///
+    /// `GRAPH ?g` still ranges over the named graphs here, so a query written
+    /// against the plain form keeps its meaning under this one.
+    pub fn sparql_select_union(&self, query: &str) -> anyhow::Result<String> {
+        self.select_with_dataset(query, true)
+    }
+
+    /// Run a SELECT once per term, with `var` pre-bound to that term, over the
+    /// union dataset. Returns the solutions per term, in the order given.
+    ///
+    /// Pre-binding is SPARQL substitution, the mechanism SHACL-SPARQL
+    /// specifies for `$this` (section 5.3.2): the term is in scope everywhere
+    /// in the query, inside `FILTER (NOT) EXISTS` and inside subqueries. A
+    /// `VALUES` join is not the same thing. A subquery is evaluated bottom-up
+    /// with no outer variable in scope, so a constraint wrapped that way ran
+    /// with `$this` unbound, asked whether ANY node matched, and one clean
+    /// record hid every dirty one (#132).
+    ///
+    /// The query is parsed once; each term gets its own substitution and
+    /// execution. The pre-bound variable is present in every returned row
+    /// whether or not the author projected it.
+    pub fn sparql_select_union_prebound(
+        &self,
+        query: &str,
+        var: &str,
+        terms: &[Term],
+    ) -> anyhow::Result<Vec<Vec<std::collections::HashMap<String, String>>>> {
+        let store = &self.store;
+        let mut prepared = SparqlEvaluator::new().parse_query(query)?;
+        prepared.dataset_mut().set_default_graph_as_union();
+        let variable = Variable::new(var)?;
+        let mut out = Vec::with_capacity(terms.len());
+        for term in terms {
+            let bound = prepared
+                .clone()
+                .substitute_variable(variable.clone(), term.clone());
+            let QueryResults::Solutions(solutions) = bound.on_store(store).execute()? else {
+                anyhow::bail!("pre-bound evaluation needs a SELECT query");
+            };
+            let vars: Vec<String> = solutions
+                .variables()
+                .iter()
+                .map(|v| v.as_str().to_string())
+                .collect();
+            let mut rows = Vec::new();
+            for solution in solutions {
+                let solution = solution?;
+                let mut row = std::collections::HashMap::new();
+                for v in &vars {
+                    if let Some(t) = solution.get(v.as_str()) {
+                        row.insert(v.clone(), t.to_string());
+                    }
+                }
+                row.entry(var.to_string())
+                    .or_insert_with(|| term.to_string());
+                rows.push(row);
+            }
+            out.push(rows);
+        }
+        Ok(out)
+    }
+
+    fn select_with_dataset(
+        &self,
+        query: &str,
+        union_default_graph: bool,
+    ) -> anyhow::Result<String> {
+        let store = &self.store;
+        let mut prepared = SparqlEvaluator::new().parse_query(query)?;
+        if union_default_graph {
+            prepared.dataset_mut().set_default_graph_as_union();
+        }
+        Self::render(prepared.on_store(store).execute()?)
+    }
+
+    /// The JSON every SELECT path in this module returns, so a scoped run and
+    /// an unscoped one differ in the dataset they read and in nothing else.
+    fn render(results: QueryResults) -> anyhow::Result<String> {
+        match results {
+            QueryResults::Solutions(solutions) => {
+                let vars: Vec<String> = solutions
+                    .variables()
+                    .iter()
+                    .map(|v| v.as_str().to_string())
+                    .collect();
+                let mut rows: Vec<serde_json::Value> = Vec::new();
+                for solution in solutions {
+                    let solution = solution?;
+                    let mut row = serde_json::Map::new();
+                    for var in &vars {
+                        if let Some(term) = solution.get(var.as_str()) {
+                            row.insert(var.clone(), serde_json::Value::String(term.to_string()));
+                        }
+                    }
+                    rows.push(serde_json::Value::Object(row));
+                }
+                Ok(serde_json::json!({"variables": vars, "results": rows}).to_string())
+            }
+            QueryResults::Boolean(b) => Ok(serde_json::json!({"result": b}).to_string()),
+            QueryResults::Graph(triples) => {
+                let mut result = Vec::new();
+                for triple in triples {
+                    let triple = triple?;
+                    result.push(serde_json::json!({
+                        "subject": triple.subject.to_string(),
+                        "predicate": triple.predicate.to_string(),
+                        "object": triple.object.to_string(),
+                    }));
+                }
+                Ok(serde_json::json!({"triples": result}).to_string())
+            }
+        }
+    }
+
+    /// Run a SPARQL UPDATE (INSERT/DELETE) against the store.
+    /// Returns the number of new triples (delta).
+    pub fn sparql_update(&self, update: &str) -> anyhow::Result<usize> {
+        let store = &self.store;
+        let before = store.len()?;
+        store.update(update)?;
+        let after = store.len()?;
+        Ok(after.saturating_sub(before))
+    }
+
+    /// Canonicalise the store's blank nodes via RDFC 1.0 (W3C Recommendation,
+    /// 21 May 2024) using SHA-256, returning a NEW `GraphStore` whose blank
+    /// nodes have deterministic `_:c14n<n>` identifiers derived from the graph
+    /// structure.
+    ///
+    /// This is the principled successor to per-callsite "filter `_:` IRIs out
+    /// of the SPARQL result set" — for any operation that depends on stable
+    /// identity across reparses (drift detection, hashing, signature
+    /// comparison), canonicalisation preserves the semantic content of
+    /// anonymous restriction classes / quoted axioms instead of dropping them.
+    ///
+    /// **Warning:** per the W3C spec, canonical IDs are a function of the
+    /// whole graph. Mutating one quad can shift many bnode IDs, so this
+    /// is poorly suited to producing minimal-diff outputs over arbitrary
+    /// edits. For drift detection specifically, the existing rename-pairing
+    /// logic in `drift.rs::detect()` will re-match shifted IDs via the
+    /// label/domain/range/hierarchy/individual signal ensemble, so the
+    /// net result is more informative than the previous "filter and forget"
+    /// approach (PR #14, @rustforrecess) that dropped bnode content entirely.
+    ///
+    /// The work is bounded by [`crate::canon::DEFAULT_CALL_BUDGET`] and a
+    /// poisoned graph is an `Err`, never a hang. oxrdf's `Dataset::canonicalize`
+    /// sets no such bound, and through it a 7-node blank-node clique took 17 to
+    /// 23 seconds to diff against itself and an 8-node clique did not finish in
+    /// three minutes (issue #293). `crate::canon` is the same Recommendation,
+    /// gated on the W3C suite in `tests/w3c-rdfc10/` label map included, so the
+    /// labels an ordinary graph receives do not change.
+    pub fn canonicalize_blank_nodes(&self) -> anyhow::Result<GraphStore> {
+        let quads = self.store.iter().collect::<Result<Vec<Quad>, _>>()?;
+        let canonical = crate::canon::canonical_quads(
+            &quads,
+            crate::canon::DEFAULT_CALL_BUDGET,
+            crate::canon::HashAlgorithm::Sha256,
+        )?;
+        let new_gs = GraphStore::new();
+        for quad in &canonical {
+            new_gs.store.insert(quad)?;
+        }
+        Ok(new_gs)
+    }
+
+    /// Canonicalise two snapshots for comparison, or, when either exhausts the
+    /// RDFC-1.0 budget, cut BOTH to the quads that mention no blank node.
+    ///
+    /// This is for commands that compare snapshots (diff, drift) and must
+    /// answer on any input, a poisoned one included. Dropping every quad that
+    /// mentions a blank node is the one cut that is still sound for what
+    /// remains: ground quads need no labels, so a change among them is a real
+    /// change and an absence is a real absence. Both sides are cut, because
+    /// canonical labels on one side against nothing on the other would report
+    /// every blank-node triple of the exact side as a change nobody made. What
+    /// the cut loses is every statement about anonymous structure, and the
+    /// returned [`Approximation`] says so with the reason and the counts.
+    pub fn canonicalize_pair(
+        old: &GraphStore,
+        new: &GraphStore,
+    ) -> anyhow::Result<(GraphStore, GraphStore, Option<Approximation>)> {
+        let budget_error = |e: anyhow::Error| match e.downcast::<crate::canon::CanonError>() {
+            Ok(canon) => Ok(canon.to_string()),
+            Err(other) => Err(other),
+        };
+        let reason = match old.canonicalize_blank_nodes() {
+            Ok(old_canon) => match new.canonicalize_blank_nodes() {
+                Ok(new_canon) => return Ok((old_canon, new_canon, None)),
+                Err(e) => budget_error(e)?,
+            },
+            Err(e) => budget_error(e)?,
+        };
+        let (old_ground, omitted_old) = old.ground_quads()?;
+        let (new_ground, omitted_new) = new.ground_quads()?;
+        Ok((old_ground, new_ground, Some(Approximation { reason, omitted_old, omitted_new })))
+    }
+
+    /// A new store holding only the quads that mention no blank node, and the
+    /// number of quads left out.
+    pub fn ground_quads(&self) -> anyhow::Result<(GraphStore, usize)> {
+        let ground = GraphStore::new();
+        let mut omitted = 0;
+        for quad in self.store.iter() {
+            let quad = quad?;
+            let mentions_blank = quad.subject.is_blank_node()
+                || quad.object.is_blank_node()
+                || quad.graph_name.is_blank_node();
+            if mentions_blank {
+                omitted += 1;
+            } else {
+                ground.store.insert(&quad)?;
+            }
+        }
+        Ok((ground, omitted))
+    }
+
+    pub fn serialize(&self, format: &str) -> anyhow::Result<String> {
+        let store = &self.store;
+        let rdf_format = Self::parse_format(format)?;
+        // Dataset formats carry the graph name; every other format is a single
+        // RDF graph. `serialize_triple` drops the graph name, flattening a quad
+        // from a named graph into the default graph. That is the only thing a
+        // triple format can do, but for the dataset formats it silently
+        // discarded the named-graph structure that temporal assertions live in
+        // (issue #95): a TriG save/reload round trip lost every
+        // `validFrom`/`validTo` binding. `serialize_quad` keeps the graph name,
+        // and for the triple formats we keep flattening. `supports_datasets`
+        // owns the list upstream, so a format added later (JSON-LD is already
+        // in it) is classified correctly rather than silently flattened.
+        //
+        // The inference graph is the one exception to that flattening. Merging
+        // materialised triples into the default graph is what let `save`
+        // publish `<ex:ghost> a <ex:Person>` as though a person had written it
+        // (flaw hunt D2, 30 Aug 2026). A triple format cannot say "this one was
+        // derived", so the only statement it can make honestly is the asserted
+        // one; the dataset formats keep the graph name and lose nothing.
+        let carries_graph_name = rdf_format.supports_datasets();
+        let inferred_graph = GraphName::NamedNode(NamedNode::new(crate::reason::INFERRED_GRAPH)?);
+        let mut buf = Vec::new();
+        let mut serializer = RdfSerializer::from_format(rdf_format).for_writer(&mut buf);
+        for quad in store.iter() {
+            let quad = quad?;
+            if carries_graph_name {
+                serializer.serialize_quad(quad.as_ref())?;
+            } else {
+                if quad.graph_name == inferred_graph {
+                    continue;
+                }
+                serializer.serialize_triple(quad.as_ref())?;
+            }
+        }
+        // `finish()` writes the final terminator (e.g. the trailing `.` on the
+        // last Turtle triple, or `</rdf:RDF>` for RDF/XML). Dropping the
+        // serializer skips this step, which produced truncated, unparseable
+        // output — see `convert` → `drift` round-trip on the Pizza ontology.
+        serializer.finish()?;
+        Ok(String::from_utf8(buf)?)
+    }
+
+    pub fn get_stats(&self) -> anyhow::Result<String> {
+        let store = &self.store;
+        let total = store.len()?;
+
+        // Count classes: explicit type declarations + implicit (subClassOf subjects/objects,
+        // domain/range targets, equivalentClass). Filters out blank nodes and OWL/RDF builtins.
+        let class_query = "SELECT (COUNT(DISTINCT ?c) AS ?count) WHERE {
+            { ?c a <http://www.w3.org/2002/07/owl#Class> }
+            UNION { ?c a <http://www.w3.org/2000/01/rdf-schema#Class> }
+            UNION { ?c <http://www.w3.org/2000/01/rdf-schema#subClassOf> ?p }
+            UNION { ?p <http://www.w3.org/2000/01/rdf-schema#subClassOf> ?c }
+            UNION { ?p <http://www.w3.org/2000/01/rdf-schema#domain> ?c }
+            UNION { ?p <http://www.w3.org/2000/01/rdf-schema#range> ?c }
+            UNION { ?c <http://www.w3.org/2002/07/owl#equivalentClass> ?p }
+            FILTER(isIRI(?c)
+                && ?c != <http://www.w3.org/2002/07/owl#Thing>
+                && ?c != <http://www.w3.org/2002/07/owl#Nothing>
+                && ?c != <http://www.w3.org/2000/01/rdf-schema#Resource>
+                && ?c != <http://www.w3.org/2000/01/rdf-schema#Literal>
+                && ?c != <http://www.w3.org/2000/01/rdf-schema#Class>
+                && ?c != <http://www.w3.org/2002/07/owl#Class>)
+        }";
+        // Count properties: explicit type + implicit (subPropertyOf, domain/range subjects)
+        let prop_query = "SELECT (COUNT(DISTINCT ?p) AS ?count) WHERE {
+            { ?p a <http://www.w3.org/2002/07/owl#ObjectProperty> }
+            UNION { ?p a <http://www.w3.org/2002/07/owl#DatatypeProperty> }
+            UNION { ?p a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> }
+            UNION { ?p <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> ?q }
+            UNION { ?q <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> ?p }
+            UNION { ?p <http://www.w3.org/2000/01/rdf-schema#domain> ?c }
+            UNION { ?p <http://www.w3.org/2000/01/rdf-schema#range> ?c }
+            FILTER(isIRI(?p)
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/1999/02/22-rdf-syntax-ns#\")
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/2000/01/rdf-schema#\")
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/2002/07/owl#\"))
+        }";
+        let individual_query = "SELECT (COUNT(DISTINCT ?i) AS ?count) WHERE { ?i a ?c . FILTER(?c != <http://www.w3.org/2002/07/owl#Class> && ?c != <http://www.w3.org/2000/01/rdf-schema#Class> && ?c != <http://www.w3.org/2002/07/owl#ObjectProperty> && ?c != <http://www.w3.org/2002/07/owl#DatatypeProperty> && ?c != <http://www.w3.org/2002/07/owl#Ontology>) }";
+
+        let count_from_query = |q: &str| -> usize {
+            let Ok(prepared) = SparqlEvaluator::new().parse_query(q) else { return 0 };
+            let Ok(QueryResults::Solutions(solutions)) = prepared
+                .on_store(store)
+                .execute()
+            else { return 0 };
+            let Some(Ok(row)) = solutions.into_iter().next() else { return 0 };
+            let Some(Term::Literal(lit)) = row.get("count") else { return 0 };
+            lit.value().parse().unwrap_or(0)
+        };
+
+        // Typed subsets: object vs datatype properties. The broad `prop_query`
+        // above also counts rdf:Property and implicit (subPropertyOf/domain/range)
+        // properties, so object + data need not sum to `properties` — but
+        // reporting the real datatype-property count is more honest than the
+        // previous hardcoded 0 (which showed e.g. Schema.org / FOAF as having no
+        // properties even though they declare hundreds).
+        let obj_prop_query = "SELECT (COUNT(DISTINCT ?p) AS ?count) WHERE {
+            ?p a <http://www.w3.org/2002/07/owl#ObjectProperty> .
+            FILTER(isIRI(?p)
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/1999/02/22-rdf-syntax-ns#\")
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/2000/01/rdf-schema#\")
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/2002/07/owl#\"))
+        }";
+        let data_prop_query = "SELECT (COUNT(DISTINCT ?p) AS ?count) WHERE {
+            ?p a <http://www.w3.org/2002/07/owl#DatatypeProperty> .
+            FILTER(isIRI(?p)
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/1999/02/22-rdf-syntax-ns#\")
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/2000/01/rdf-schema#\")
+                && !STRSTARTS(STR(?p), \"http://www.w3.org/2002/07/owl#\"))
+        }";
+
+        let classes = count_from_query(class_query);
+        let props = count_from_query(prop_query);
+        let object_props = count_from_query(obj_prop_query);
+        let data_props = count_from_query(data_prop_query);
+        let individuals = count_from_query(individual_query);
+
+        Ok(serde_json::json!({
+            "triples": total,
+            "classes": classes,
+            "object_properties": object_props,
+            "data_properties": data_props,
+            "properties": props,
+            "individuals": individuals
+        })
+        .to_string())
+    }
+
+    pub fn clear(&self) -> anyhow::Result<()> {
+        let store = &self.store;
+        store.clear()?;
+        Ok(())
+    }
+
+    pub fn load_ntriples(&self, content: &str) -> anyhow::Result<usize> {
+        self.load_lines(content, RdfFormat::NTriples)
+    }
+
+    /// Load N-Quads, keeping every graph name.
+    ///
+    /// The line-based sibling of [`load_ntriples`](Self::load_ntriples), for
+    /// the paths that round-trip a whole dataset rather than one graph — the
+    /// compile cache above all, where N-Triples silently flattened everything
+    /// it was asked to hold.
+    pub fn load_nquads(&self, content: &str) -> anyhow::Result<usize> {
+        self.load_lines(content, RdfFormat::NQuads)
+    }
+
+    fn load_lines(&self, content: &str, format: RdfFormat) -> anyhow::Result<usize> {
+        let store = &self.store;
+        let reader = Cursor::new(content.as_bytes());
+        let parser = RdfParser::from_format(format).for_reader(reader);
+        let mut count = 0;
+        for quad in parser {
+            store.insert(&quad?)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub fn snapshot(&self, format: &str) -> anyhow::Result<String> {
+        self.serialize(format)
+    }
+
+    pub async fn fetch_url(url: &str) -> anyhow::Result<String> {
+        let resp = reqwest::get(url).await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("HTTP {}: {}", resp.status(), url);
+        }
+        Ok(resp.text().await?)
+    }
+
+    /// Run a SPARQL query against an open (unauthenticated) endpoint.
+    pub async fn fetch_sparql(endpoint: &str, query: &str) -> anyhow::Result<String> {
+        Self::fetch_sparql_auth(endpoint, query, &SparqlAuth::default()).await
+    }
+
+    /// Run a SPARQL query against an endpoint, with optional HTTP auth.
+    ///
+    /// Works against any SPARQL 1.1 Protocol endpoint: Apache Jena/Fuseki and
+    /// Eclipse RDF4J (no auth), Stardog and Ontotext GraphDB (Basic/Bearer).
+    /// Amazon Neptune with IAM auth requires SigV4 request signing, which this
+    /// path does not perform; use an unsigned/IAM-disabled endpoint or a signing
+    /// proxy in front of Neptune.
+    pub async fn fetch_sparql_auth(
+        endpoint: &str,
+        query: &str,
+        auth: &SparqlAuth,
+    ) -> anyhow::Result<String> {
+        let client = reqwest::Client::new();
+        let rb = client
+            .post(endpoint)
+            .header("Content-Type", "application/sparql-query")
+            .header("Accept", "text/turtle")
+            .body(query.to_string());
+        let resp = auth.apply(rb).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("SPARQL endpoint returned HTTP {}", resp.status());
+        }
+        Ok(resp.text().await?)
+    }
+
+    /// Push triples to an open (unauthenticated) endpoint, default graph.
+    pub async fn push_sparql(endpoint: &str, content: &str) -> anyhow::Result<String> {
+        Self::push_sparql_auth(endpoint, content, None, &SparqlAuth::default()).await
+    }
+
+    /// Push triples to an endpoint via SPARQL 1.1 Update, with optional named
+    /// graph and HTTP auth.
+    pub async fn push_sparql_auth(
+        endpoint: &str,
+        content: &str,
+        graph: Option<&str>,
+        auth: &SparqlAuth,
+    ) -> anyhow::Result<String> {
+        let update = match graph {
+            Some(g) => {
+                // The graph name is spliced into a SPARQL 1.1 Update sent verbatim to
+                // the remote endpoint, which parses it with no store in between. A
+                // value like `x> {} }; DROP ALL ; INSERT DATA { GRAPH <x` would close
+                // the GRAPH IRI and append arbitrary destructive operations. Validate
+                // it as an absolute IRI first; NamedNode::new rejects '>', whitespace,
+                // braces and quotes, so a value that survives cannot break out.
+                NamedNode::new(g).map_err(|e| {
+                    anyhow::anyhow!("graph is not a valid absolute IRI: {e}")
+                })?;
+                format!("INSERT DATA {{ GRAPH <{g}> {{ {content} }} }}")
+            }
+            None => format!("INSERT DATA {{ {content} }}"),
+        };
+        let client = reqwest::Client::new();
+        let rb = client
+            .post(endpoint)
+            .header("Content-Type", "application/sparql-update")
+            .body(update);
+        let resp = auth.apply(rb).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("SPARQL update returned HTTP {}", resp.status());
+        }
+        Ok(format!("Pushed to {}: HTTP {}", endpoint, resp.status()))
+    }
+
+    /// Extract all triples as (subject, predicate, object) string tuples.
+    ///
+    /// Reads EVERY graph and drops the graph name. That is the right answer for
+    /// a single-version store and the wrong one for a store that keeps several
+    /// versions of the same entity in several named graphs, where the union is
+    /// a state that held at no instant.
+    ///
+    /// A caller that is going to treat what it gets back as ASSERTED wants one
+    /// of the two narrower forms instead, because this method cannot tell an
+    /// assertion from a triple some earlier run of the reasoner parked in a
+    /// named graph, and the certificate layer's soundness theorem is
+    /// conditional on the assertions:
+    /// [`triples_outside`](Self::triples_outside) excludes named graphs by
+    /// name, and [`triples_in_scope`](Self::triples_in_scope) reads a stated
+    /// set. This one is what [`ReadScope::AllGraphs`] means and is kept
+    /// unchanged so a run that asks for every graph gets byte-identical input
+    /// to the one it always got.
+    pub fn all_triples(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+        let store = &self.store;
+        let mut triples = Vec::new();
+        for quad in store.iter() {
+            let quad = quad?;
+            let s = quad.subject.to_string();
+            let p = quad.predicate.to_string();
+            let o = quad.object.to_string();
+            triples.push((s, p, o));
+        }
+        Ok(triples)
+    }
+
+    /// The triples of exactly the graphs a scope names, in the spelling
+    /// [`all_triples`](Self::all_triples) yields.
+    ///
+    /// The default graph comes first when it is in scope, then each named
+    /// graph in the order the scope lists them, so the line order of a
+    /// certificate written from this is a function of the scope and the store
+    /// rather than of iteration order.
+    ///
+    /// A named graph the scope lists and the store does not hold contributes
+    /// nothing and is NOT an error: a snapshot names the graphs that were in
+    /// scope, and a graph can be in scope and empty.
+    pub fn triples_in_scope(&self, scope: &ReadScope) -> anyhow::Result<AssertedTriples> {
+        let ReadScope::Graphs {
+            default_graph,
+            named,
+        } = scope
+        else {
+            // `AllGraphs` is every graph the caller may read, and that is still
+            // not every graph in the store: the inference graph is where this
+            // engine parks its OWN conclusions, and reading them back makes run
+            // N's conclusions run N+1's axioms with nothing in `asserted.tsv`
+            // saying they were derived. TCB-8.
+            //
+            // This used to be `all_triples()`, which is byte-identical to the
+            // historical behaviour and reintroduced that defect the moment a
+            // store held a previous materialisation.
+            // `tcb_8_across_runs_only_the_default_graph_leaks` caught it.
+            return self.triples_outside(&[crate::reason::INFERRED_GRAPH]);
+        };
+        // One transaction for the WHOLE scope, not one per graph. A scoped run
+        // reads several named graphs and its certificate asserts they were
+        // read together; reading them under separate transactions would let a
+        // write land between two of them and produce an asserted set that
+        // existed at no instant, which is the defect this closes arriving one
+        // level down.
+        self.read_one_state(|txn| {
+        let mut triples = Vec::new();
+        // The names actually read, in the order read, so a certificate records
+        // what it was built from rather than what was asked for. The two differ
+        // whenever a named graph in scope holds nothing.
+        let mut read: Vec<String> = Vec::new();
+        // Returns how many it took, so the caller can record the graph only
+        // when it actually contributed. Counting inside avoids reading
+        // `triples.len()` while the closure still holds it mutably.
+        let mut take = |g: GraphNameRef<'_>| -> anyhow::Result<usize> {
+            let mut n = 0usize;
+            for quad in txn.quads_for_pattern(None, None, None, Some(g)) {
+                let q = quad?;
+                triples.push((
+                    q.subject.to_string(),
+                    q.predicate.to_string(),
+                    q.object.to_string(),
+                ));
+                n += 1;
+            }
+            Ok(n)
+        };
+        if *default_graph && take(GraphNameRef::DefaultGraph)? > 0 {
+            read.push("<default>".to_string());
+        }
+        for g in named {
+            let node = NamedNode::new(g).map_err(|e| anyhow::anyhow!("{g} is not an IRI: {e}"))?;
+            if take(GraphNameRef::NamedNode(node.as_ref()))? > 0 {
+                read.push(g.clone());
+            }
+        }
+        Ok((triples, read))
+        })
+    }
+
+    /// Run a SELECT over exactly the graphs a scope names.
+    ///
+    /// [`ReadScope::AllGraphs`] is [`sparql_select_union`](Self::sparql_select_union)
+    /// unchanged. A stated set of graphs becomes the query's default graph, so
+    /// an UNGUARDED pattern sees the union of those graphs and nothing else,
+    /// and the same set is the only one a `GRAPH` block can reach: without
+    /// [`set_available_named_graphs`] a `sh:sparql` constraint could name an
+    /// out-of-scope graph and read it, which is the escape `Temporal::query_at`
+    /// closes with `FROM NAMED` for the same reason.
+    ///
+    /// [`set_available_named_graphs`]: https://docs.rs/spareval
+    pub fn sparql_select_scoped(&self, query: &str, scope: &ReadScope) -> anyhow::Result<String> {
+        match scope {
+            ReadScope::AllGraphs => self.sparql_select_union(query),
+            ReadScope::Graphs { .. } => {
+                let mut prepared = SparqlEvaluator::new().parse_query(query)?;
+                scope.apply(prepared.dataset_mut())?;
+                Self::render(prepared.on_store(&self.store).execute()?)
+            }
+        }
+    }
+
+    /// [`sparql_select_union_prebound`](Self::sparql_select_union_prebound),
+    /// restricted to the graphs a scope names.
+    pub fn sparql_select_scoped_prebound(
+        &self,
+        query: &str,
+        var: &str,
+        terms: &[Term],
+        scope: &ReadScope,
+    ) -> anyhow::Result<Vec<Vec<std::collections::HashMap<String, String>>>> {
+        let store = &self.store;
+        let mut prepared = SparqlEvaluator::new().parse_query(query)?;
+        scope.apply(prepared.dataset_mut())?;
+        let variable = Variable::new(var)?;
+        let mut out = Vec::with_capacity(terms.len());
+        for term in terms {
+            let bound = prepared
+                .clone()
+                .substitute_variable(variable.clone(), term.clone());
+            let QueryResults::Solutions(solutions) = bound.on_store(store).execute()? else {
+                anyhow::bail!("pre-bound evaluation needs a SELECT query");
+            };
+            let vars: Vec<String> = solutions
+                .variables()
+                .iter()
+                .map(|v| v.as_str().to_string())
+                .collect();
+            let mut rows = Vec::new();
+            for solution in solutions {
+                let solution = solution?;
+                let mut row = std::collections::HashMap::new();
+                for v in &vars {
+                    if let Some(t) = solution.get(v.as_str()) {
+                        row.insert(v.clone(), t.to_string());
+                    }
+                }
+                row.entry(var.to_string())
+                    .or_insert_with(|| term.to_string());
+                rows.push(row);
+            }
+            out.push(rows);
+        }
+        Ok(out)
+    }
+
+    /// Read the store inside ONE transaction, so a concurrent write cannot be
+    /// observed half applied.
+    ///
+    /// Oxigraph 0.5 gives transactions the "repeatable read" isolation level:
+    /// the state a reader sees does not change for the duration. Without one,
+    /// `iter()` walks a store another thread may be writing to, and a
+    /// certified run can then record an `asserted.tsv` describing a graph that
+    /// existed at no instant. `tests/store_atomicity_test.rs` measures exactly
+    /// that: a reader caught a one-quad-at-a-time write half done 620 times,
+    /// and saw only the before and after states once the write was
+    /// transactional.
+    ///
+    /// This matters for TCB-6 and TCB-7, which say `asserted.tsv` IS the graph
+    /// reasoned over. The Lean checker cannot see a torn read: the file would
+    /// be internally consistent and would prove things about a graph nobody
+    /// ever had. `serve-http` and `daemon` share one `Arc<GraphStore>` across
+    /// every session, so the two writers are not hypothetical.
+    ///
+    /// This used to open a TRANSACTION, which was atomic and cost more than it
+    /// needed to. On the in-memory backend, which is what `GraphStore::new`
+    /// builds and what `serve-http` and `daemon` share, an open read
+    /// transaction blocks every writer until it commits: `Store::insert` opens
+    /// a transaction of its own and `MemoryStorage::start_transaction` waits.
+    /// A selection over a large graph therefore stopped every writer for the
+    /// length of the read. Measured in `tests/transaction_isolation_test.rs`.
+    ///
+    /// It now takes a SNAPSHOT, which pins the same one state and holds no
+    /// lock, so writers proceed while the read runs. `Store::snapshot` is not
+    /// in Oxigraph 0.5.9; it is the patch this repository carries and is
+    /// pinned by revision in `Cargo.toml`. See decision 0010 for why neither
+    /// the transaction nor the copy it was weighed against was good enough.
+    fn read_one_state<T>(
+        &self,
+        f: impl FnOnce(&oxigraph::store::StoreSnapshot) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        f(&self.store.snapshot())
+    }
+
+    /// Every triple in the store EXCEPT those in the named graphs listed, in
+    /// the same spelling [`all_triples`](Self::all_triples) yields, together
+    /// with the names of the graphs that were read.
+    ///
+    /// See [`AssertedTriples`] for the pair it returns.
+    ///
+    /// This exists for the certified reasoning paths and it closes a real
+    /// defect. `onto_reason` with `inference_graph: true` parks its conclusions
+    /// in `https://open-ontologies.org/graph/inferred` so that nothing
+    /// downstream reads an inference as an assertion, but the reasoner is
+    /// itself downstream: `all_triples` reads every named graph, so a second
+    /// certified run listed the first run's conclusions in `asserted.tsv` as
+    /// axioms, with no column saying they were derived. The separation
+    /// protected `save` and not the certificate. See TCB-8 in
+    /// `docs/trusted-computing-base.md`.
+    ///
+    /// The graph names are returned because a certificate that says which
+    /// graphs it read is checkable against the store, and one that does not is
+    /// not. `<default>` is the unnamed graph.
+    pub fn triples_outside(&self, excluded: &[&str]) -> anyhow::Result<AssertedTriples> {
+        self.read_one_state(|txn| {
+        let mut triples = Vec::new();
+        let mut read: BTreeSet<String> = BTreeSet::new();
+        for quad in txn.iter() {
+            let quad = quad?;
+            let name = match &quad.graph_name {
+                GraphName::DefaultGraph => "<default>".to_string(),
+                GraphName::NamedNode(n) => n.as_str().to_string(),
+                GraphName::BlankNode(b) => format!("_:{}", b.as_str()),
+            };
+            if excluded.iter().any(|e| *e == name) {
+                continue;
+            }
+            read.insert(name);
+            triples.push((
+                quad.subject.to_string(),
+                quad.predicate.to_string(),
+                quad.object.to_string(),
+            ));
+        }
+            Ok((triples, read.into_iter().collect()))
+        })
+    }
+
+    /// Copy one named graph of this store into a fresh store's DEFAULT graph,
+    /// by model term.
+    ///
+    /// This is the only route by which a projection can be a subset of the
+    /// source in the strong sense, blank nodes included. Serialising a slice to
+    /// Turtle and re-parsing it mints fresh blank node labels, and every
+    /// blank-node-bearing triple then looks like an addition rather than a
+    /// copy, which turns a faithful slice into a monotonicity alarm.
+    ///
+    /// [`canonicalize_blank_nodes`](Self::canonicalize_blank_nodes) is NOT the
+    /// alternative and reaching for it is the trap this method exists to close:
+    /// RDFC-1.0 labels are a function of the WHOLE graph, so the same blank
+    /// node canonicalises differently in a slice than in the source precisely
+    /// because the slice has fewer triples around it.
+    pub fn graph_store(&self, graph_iri: &str) -> anyhow::Result<GraphStore> {
+        let name = NamedNode::new(graph_iri)
+            .map_err(|e| anyhow::anyhow!("{graph_iri} is not an IRI: {e}"))?;
+        let out = GraphStore::new();
+        for quad in self
+            .store
+            .quads_for_pattern(None, None, None, Some(GraphNameRef::NamedNode(name.as_ref())))
+        {
+            let q = quad?;
+            out.store.insert(&Quad::new(
+                q.subject.clone(),
+                q.predicate.clone(),
+                q.object.clone(),
+                GraphName::DefaultGraph,
+            ))?;
+        }
+        Ok(out)
+    }
+
+    /// Triples of one named graph, in the same spelling [`all_triples`] yields.
+    ///
+    /// [`all_triples`]: Self::all_triples
+    pub fn graph_triples(&self, graph_iri: &str) -> anyhow::Result<Vec<(String, String, String)>> {
+        let name = NamedNode::new(graph_iri)
+            .map_err(|e| anyhow::anyhow!("{graph_iri} is not an IRI: {e}"))?;
+        let mut triples = Vec::new();
+        for quad in self
+            .store
+            .quads_for_pattern(None, None, None, Some(GraphNameRef::NamedNode(name.as_ref())))
+        {
+            let q = quad?;
+            triples.push((
+                q.subject.to_string(),
+                q.predicate.to_string(),
+                q.object.to_string(),
+            ));
+        }
+        Ok(triples)
+    }
+
+    /// The names of the named graphs this store holds, sorted.
+    pub fn named_graph_iris(&self) -> anyhow::Result<Vec<String>> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for quad in self.store.iter() {
+            let q = quad?;
+            if let GraphName::NamedNode(n) = &q.graph_name {
+                names.insert(n.as_str().to_string());
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// How many triples sit in [`crate::reason::INFERRED_GRAPH`].
+    ///
+    /// Non-zero means an earlier `reason` run materialised into this store, so
+    /// "what this graph asserts" is no longer "what a person wrote". Any tool
+    /// that reads the store as a set of assertions has to be able to say that
+    /// rather than quietly treat the engine's own output as an axiom.
+    pub fn materialised_inference_count(&self) -> anyhow::Result<usize> {
+        Ok(self.graph_triples(crate::reason::INFERRED_GRAPH)?.len())
+    }
+
+    /// Every quad as `(subject, predicate, object, graph)` strings, the graph
+    /// being `""` for the default graph.
+    pub fn all_quads(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
+        let mut out = Vec::new();
+        for quad in self.store.iter() {
+            let q = quad?;
+            out.push((
+                q.subject.to_string(),
+                q.predicate.to_string(),
+                q.object.to_string(),
+                match &q.graph_name {
+                    GraphName::DefaultGraph => String::new(),
+                    GraphName::NamedNode(n) => n.to_string(),
+                    GraphName::BlankNode(b) => b.to_string(),
+                },
+            ))
+        }
+        Ok(out)
+    }
+
+    /// Round-trip triples through a STORE, in order, keeping duplicates.
+    ///
+    /// Parsing alone is not enough, and this is measured rather than assumed:
+    /// oxigraph's parser preserves a literal's lexical form, and it is the
+    /// STORE that normalises it. `"01"^^xsd:integer` comes back from
+    /// [`parse_triples_ordered`](Self::parse_triples_ordered) exactly as
+    /// written and out of [`all_triples`](Self::all_triples) as
+    /// `"1"^^xsd:integer`. A caller that compares its own spelling of a term
+    /// against what a certificate holds therefore has to push the term through
+    /// a store first, or it matches nothing and the miss looks like data loss.
+    ///
+    /// Each triple gets its own named graph, because a store is a SET: two
+    /// identical inputs would otherwise collapse to one and the caller's
+    /// pairing between what it wrote and what came back would shift silently.
+    ///
+    /// A triple no RDF serialiser can write, such as one with a literal
+    /// subject, comes back as `None` in its own position rather than shifting
+    /// the others.
+    pub fn canonicalise_triples(
+        triples: &[(String, String, String)],
+    ) -> anyhow::Result<Vec<Option<(String, String, String)>>> {
+        let store = GraphStore::new();
+        let batch: String = triples
+            .iter()
+            .enumerate()
+            .map(|(i, (s, p, o))| format!("{s} {p} {o} <urn:oo:canon:{i}> .\n"))
+            .collect();
+        if store.load_nquads(&batch).is_err() {
+            // One bad line poisons the batch, so fall back to per-line and let
+            // only the bad line fail.
+            let retry = GraphStore::new();
+            for (i, (s, p, o)) in triples.iter().enumerate() {
+                let _ = retry.load_nquads(&format!("{s} {p} {o} <urn:oo:canon:{i}> .\n"));
+            }
+            return Self::collect_canonical(&retry, triples.len());
+        }
+        Self::collect_canonical(&store, triples.len())
+    }
+
+    fn collect_canonical(
+        store: &GraphStore,
+        n: usize,
+    ) -> anyhow::Result<Vec<Option<(String, String, String)>>> {
+        let mut out = vec![None; n];
+        for (s, p, o, g) in store.all_quads()? {
+            let Some(idx) = g
+                .strip_prefix("<urn:oo:canon:")
+                .and_then(|x| x.strip_suffix('>'))
+                .and_then(|x| x.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if idx < out.len() {
+                out[idx] = Some((s, p, o));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The serialisation of a document, deciding between the RDF formats
+    /// Oxigraph parses and the one this crate parses itself.
+    ///
+    /// OWL functional syntax wins on content before anything else is
+    /// consulted, because the extension it most often travels under is `.owl`,
+    /// and `.owl` means RDF/XML to [`Self::detect_format`]. The ORE 2015
+    /// reasoner-competition corpus is 1,920 such files and every one of them
+    /// reached the RDF/XML parser and died on its first line. `.ofn` is the
+    /// one extension that names the syntax, so it is honoured even when the
+    /// content does not sniff, which sends a malformed `.ofn` file to the
+    /// reader that can say what is wrong with it.
+    fn detect_source_format(path: &str, content: &str) -> SourceFormat {
+        if crate::ofn::looks_like_ofn(content) || path.to_ascii_lowercase().ends_with(".ofn") {
+            return SourceFormat::OwlFunctional;
+        }
+        SourceFormat::Rdf(Self::detect_format_sniffed(path, content))
+    }
+
+    fn detect_format(path: &str) -> RdfFormat {
+        if path.ends_with(".ttl") || path.ends_with(".turtle") {
+            RdfFormat::Turtle
+        } else if path.ends_with(".nt") || path.ends_with(".ntriples") {
+            RdfFormat::NTriples
+        } else if path.ends_with(".rdf") || path.ends_with(".xml") || path.ends_with(".owl") {
+            RdfFormat::RdfXml
+        } else if path.ends_with(".nq") {
+            RdfFormat::NQuads
+        } else if path.ends_with(".trig") {
+            RdfFormat::TriG
+        } else if path.ends_with(".jsonld") || path.ends_with(".json") {
+            RdfFormat::JsonLd {
+                profile: JsonLdProfileSet::empty(),
+            }
+        } else {
+            RdfFormat::Turtle
+        }
+    }
+
+    /// Format detection that consults the file body, not just the extension.
+    ///
+    /// `.owl` is ambiguous in the wild: the extension says "an OWL ontology"
+    /// and says nothing about the serialisation. Both RDF/XML and Turtle are
+    /// routinely published as `.owl`, so trusting the extension alone makes a
+    /// perfectly valid file fail to parse. Sniff the first non-blank,
+    /// non-comment line and let the content decide.
+    fn detect_format_sniffed(path: &str, content: &str) -> RdfFormat {
+        let ext_format = Self::detect_format(path);
+
+        let head = content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .unwrap_or("");
+
+        // XML declaration or an opening tag means RDF/XML regardless of name.
+        if head.starts_with("<?xml") || head.starts_with("<rdf:") || head.starts_with("<RDF") {
+            return RdfFormat::RdfXml;
+        }
+
+        // Turtle/TriG directives. `<` alone is not a signal: it also opens an
+        // N-Triples subject IRI, so only treat explicit directives as proof.
+        let is_turtle_directive = head.starts_with("@prefix")
+            || head.starts_with("@base")
+            || head.to_uppercase().starts_with("PREFIX ")
+            || head.to_uppercase().starts_with("BASE ");
+
+        if is_turtle_directive && matches!(ext_format, RdfFormat::RdfXml) {
+            return RdfFormat::Turtle;
+        }
+
+        // A JSON body is proof of JSON-LD in a way `{` alone is not: TriG also
+        // opens its default graph block with `{`, and Turtle admits `[` as a
+        // blank-node subject. Requiring a JSON-LD keyword alongside the opening
+        // brace keeps those two out while still rescuing the common case of a
+        // JSON-LD document published under `.owl`, `.rdf` or no extension at
+        // all, which would otherwise reach the Turtle parser and die there.
+        let opens_json = head.starts_with('{') || head.starts_with('[');
+        let has_jsonld_keyword = content.contains("\"@context\"")
+            || content.contains("\"@id\"")
+            || content.contains("\"@graph\"");
+        if opens_json && has_jsonld_keyword {
+            return RdfFormat::JsonLd {
+                profile: JsonLdProfileSet::empty(),
+            };
+        }
+
+        ext_format
+    }
+
+    /// Parse RDF text and return the triples in DOCUMENT ORDER, in the same
+    /// spelling [`all_triples`](Self::all_triples) yields, without inserting
+    /// anything into a store.
+    ///
+    /// The store is a set, so loading a goal document and reading it back
+    /// loses both the order and the duplicates, and a caller that needs to
+    /// pair each parsed triple with the line the caller wrote cannot do it
+    /// that way. This runs the SAME parser the store runs, which is the only
+    /// thing that makes a caller's spelling of a term comparable with the
+    /// interner's, and keeps the pairing.
+    pub fn parse_triples_ordered(
+        text: &str,
+        format: &str,
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        let rdf_format = Self::parse_format(format)?;
+        let reader = Cursor::new(text.as_bytes());
+        let quads: Vec<Quad> = RdfParser::from_format(rdf_format)
+            .for_reader(reader)
+            .collect::<Result<_, _>>()?;
+        Ok(quads
+            .into_iter()
+            .map(|q| {
+                (
+                    q.subject.to_string(),
+                    q.predicate.to_string(),
+                    q.object.to_string(),
+                )
+            })
+            .collect())
+    }
+
+    fn parse_format(name: &str) -> anyhow::Result<RdfFormat> {
+        match name.to_lowercase().as_str() {
+            "turtle" | "ttl" => Ok(RdfFormat::Turtle),
+            "ntriples" | "nt" => Ok(RdfFormat::NTriples),
+            "rdfxml" | "rdf" | "xml" | "owl" => Ok(RdfFormat::RdfXml),
+            "nquads" | "nq" => Ok(RdfFormat::NQuads),
+            "trig" => Ok(RdfFormat::TriG),
+            // "json-ld" is the spelling in the W3C media type registration and
+            // in most other tooling, so rejecting it turns a correct format
+            // name into an error.
+            "jsonld" | "json-ld" | "json" => Ok(RdfFormat::JsonLd {
+                profile: JsonLdProfileSet::empty(),
+            }),
+            _ => anyhow::bail!(
+                "Unknown format: {}. Supported: turtle, ntriples, rdfxml, nquads, trig, jsonld",
+                name
+            ),
+        }
+    }
+}

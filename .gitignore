@@ -1,0 +1,101 @@
+/target
+.worktrees/
+data/
+!case-studies/heritage-aerial/data/
+!case-studies/heritage-aerial/data/**
+!case-studies/mcp-ies-rag-demo/data/
+!case-studies/mcp-ies-rag-demo/data/**
+!case-studies/modip-plastics-kg/data/
+!case-studies/modip-plastics-kg/data/**
+!case-studies/robot-safety-security-crosswalk/data/
+!case-studies/robot-safety-security-crosswalk/data/**
+!case-studies/foundry-owl-crosswalk/data/
+!case-studies/foundry-owl-crosswalk/data/**
+# OntoAxiom ground truth + scored results — the benchmark claims are unverifiable without them
+!benchmark/ontoaxiom/data/
+!benchmark/ontoaxiom/data/**
+# Ignore generated OWL files in root, but keep benchmark references
+/*.owl
+
+# Reasoner benchmark artifacts (downloaded corpora, jars, generated files)
+benchmark/reasoner/corpora/
+benchmark/reasoner/lib/
+benchmark/reasoner/*.class
+benchmark/reasoner/results/
+__pycache__/
+python/oo_lite_test.duckdb
+.identifiers-guard
+.superpowers/
+
+# Pipeline output demo/README.md documents as regenerated on every run and
+# not checked in (see its "Derived artifacts" section). Was untracked but
+# not ignored, so it showed up as permanent noise in `git status`.
+demo/derived/
+demo/corpus_extracted/
+demo/_review.jsonl
+
+# Confidentiality guards, promoted from one case study's .gitignore to the root.
+# The pattern that protected `case-studies/foundry-owl-crosswalk/` worked, and it
+# protected exactly one directory out of eighteen. A naming discipline defeated
+# by one misnamed file is not a guard.
+#
+# Outreach drafts name real recipients. Never publish them.
+OUTREACH.md
+**/OUTREACH.md
+**/OUTREACH*.md
+**/outreach/
+**/CAMPAIGN*.md
+**/PROSPECTS*.md
+**/PRIVATE*.md
+**/BIDNOBID*.md
+**/*-internal.md
+
+# Environment files. `studio/.env` was committed once; it held a port number and
+# no harm was done, which is the only reason this is a near miss and not a story.
+.env
+.env.*
+!.env.example
+**/.env
+!**/.env.example
+
+# In-progress research. This was protected only by .git/info/exclude, which is
+# local-only: it does not travel with the repo, it is gone on a fresh clone, and
+# it is invisible to a collaborator or to an agent working in one.
+benchmark/handshake_gate/
+
+# The native Isabelle checker, linked from the committed generated ML by
+# isabelle/build_native.sh. A build artefact, not a source: it is a machine-specific
+# binary linked against the Poly/ML runtime in whichever Isabelle installation was
+# found, so committing it would ship a file that runs on one machine.
+isabelle/build/
+
+# Claude Code agent worktrees: machine-local, never part of the repo.
+.claude/worktrees/
+
+# rocq/ build artefacts. Nothing here is a source.
+#
+# theories/FixtureData.v is GENERATED from tests/fixtures/horn/ by
+# gen_fixture_data.sh on every build, deliberately rather than committed: a
+# committed copy of a fixture is a second file that can drift from the first, and
+# a kernel gate over a drifted copy is a gate over nothing.
+#
+# driver/rocq_horn_core.ml* is the extraction output and is NOT committed, which
+# is the opposite of what isabelle/driver/oo_horn_generated.ML does. The reason
+# the Isabelle export is committed is that regenerating it needs several
+# gigabytes of Isabelle; regenerating this one needs a container image CI already
+# pulls, so committing it would buy nothing and add an artefact no job rebuilds.
+rocq/build/
+rocq/theories/FixtureData.v
+rocq/theories/*.vo
+rocq/theories/*.vok
+rocq/theories/*.vos
+rocq/theories/*.glob
+rocq/theories/.*.aux
+rocq/Makefile.rocq
+rocq/Makefile.rocq.conf
+rocq/.Makefile.rocq.d
+rocq/driver/rocq_horn_core.ml
+rocq/driver/rocq_horn_core.mli
+rocq/driver/*.cmi
+rocq/driver/*.cmx
+rocq/driver/*.o

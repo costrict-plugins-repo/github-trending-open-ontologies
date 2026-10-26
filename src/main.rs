@@ -1,0 +1,4226 @@
+use clap::{Parser, Subcommand};
+use rmcp::ServiceExt;
+use std::sync::Arc;
+
+use open_ontologies::config::{Config, expand_tilde};
+use open_ontologies::graph::GraphStore;
+use open_ontologies::server::OpenOntologiesServer;
+use open_ontologies::state::StateDb;
+
+const DEFAULT_CONFIG: &str = r#"[general]
+data_dir = "~/.open-ontologies"
+
+# Optional on-disk ontology repository directories. When set, the
+# `onto_repo_list` and `onto_repo_load` MCP tools enumerate and load
+# RDF/OWL files (.ttl, .nt, .rdf, .owl, .nq, .trig, .jsonld) from these
+# directories. Container-friendly: mount a host folder of TTL files.
+# Override at runtime with the `OPEN_ONTOLOGIES_ONTOLOGY_DIRS` env var
+# (':' separated on Unix, ';' on Windows; either accepted on both).
+# ontology_dirs = ["./ttl_data"]
+
+# [cache]
+# Compile-cache: parsed ontologies are written to N-Triples files for fast reload.
+# enabled = true
+# dir = "~/.open-ontologies/cache"
+# # Idle timeout in seconds before the active ontology is unloaded from memory.
+# # Set to 0 to disable eviction. The on-disk cache file is always preserved
+# # across evictions; the next query reloads it transparently.
+# # `idle_ttl_secs` is the canonical name; `unload_timeout_secs` is an alias.
+# idle_ttl_secs = 0
+# # unload_timeout_secs = 0
+# # How often the background evictor runs (seconds).
+# evictor_interval_secs = 30
+# # When true, every read tool checks the source file's mtime/sha and
+# # recompiles if it changed.
+# auto_refresh = false
+# # Bytes from the head of each ontology file that are sha256-hashed for the
+# # cache fingerprint tie-breaker. Increase for very large dumps.
+# hash_prefix_bytes = 65536
+
+# [storage]
+# Backend for the main triple store.
+#   mode = "memory"      # in-memory (default; lost on restart)
+#   mode = "persistent"  # RocksDB at <data_dir>/triplestore; survives restarts
+# Override at runtime with OPEN_ONTOLOGIES_STORAGE_MODE or `--storage-mode`.
+# Note: only one server process can hold the persistent store open at a time.
+# mode = "memory"
+
+# [tools]
+# Restrict which MCP tools this server advertises. Two axes, both of which only
+# ever narrow.
+#
+# profile - a named subset sized for one job, so a client sees the tools it
+# needs instead of the whole catalogue. Default "full" (everything this build
+# can serve), which is what every existing client already gets. Override with
+# --tool-profile or OPEN_ONTOLOGIES_TOOL_PROFILE. An unknown name refuses to
+# start rather than quietly falling back to "full".
+# profile = "full"   # authoring | validation | reasoning | alignment |
+#                    # governance | data | planning | retrieval | evaluation
+#
+# mode/list/groups - the older allow/deny axis, which asks what a caller may be
+# trusted to do rather than what it is here to do. Applied after the profile.
+# mode = "all" | "allow" | "deny"
+# list = ["onto_status", "onto_query", "onto_load"]
+# # Groups: read_only, mutating, governance, remote, embeddings, sql.
+# groups = ["read_only"]
+
+# [embeddings]
+# Provider selects how text embeddings are computed. Override at runtime
+# with OPEN_ONTOLOGIES_EMBEDDINGS_PROVIDER.
+# provider = "local"   # or "openai" for any OpenAI-compatible API
+#
+# ── Local provider (provider = "local", default) ────────────────────────
+# Paths to a local ONNX model and tokenizer (loaded at runtime).
+# Default is the multilingual MiniLM model (see model_url below); labels in
+# different natural languages embed into a shared space for cross-lingual
+# alignment.
+# model_path = "~/.open-ontologies/models/paraphrase-multilingual-MiniLM-L12-v2.onnx"
+# tokenizer_path = "~/.open-ontologies/models/tokenizer.json"
+#
+# URLs used by `open-ontologies init` to download the model.
+# Override these to use a different sentence-transformer model. To go back to
+# the smaller English-only model set these to BAAI/bge-small-en-v1.5.
+# The model must be exported to ONNX and use a Hugging Face tokenizer.json.
+# model_url = "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/onnx/model.onnx"
+# tokenizer_url = "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/tokenizer.json"
+# model_name = "paraphrase-multilingual-MiniLM-L12-v2.onnx"
+#
+# [language]
+# Preferred natural-language tags for the labels onto_align consults. Untagged
+# literals are always kept. Empty (default) = keep ALL languages (multilingual
+# matching, paired with the multilingual embedding model above). Override with
+# OPEN_ONTOLOGIES_LANGUAGES=en,fr
+# preferred = []
+#
+# ── OpenAI-compatible provider (provider = "openai") ────────────────────
+# Works with the official OpenAI API, Azure OpenAI, Ollama, vLLM, LocalAI,
+# LM Studio, Together, Mistral, and any other gateway that speaks the
+# `POST {api_base}/embeddings` protocol. Each field can be overridden via
+# environment variables:
+#   OPEN_ONTOLOGIES_EMBEDDINGS_API_BASE
+#   OPEN_ONTOLOGIES_EMBEDDINGS_API_KEY  (or OPENAI_API_KEY)
+#   OPEN_ONTOLOGIES_EMBEDDINGS_MODEL
+# api_base = "https://api.openai.com/v1"
+# api_key = "sk-..."                # optional — env vars take precedence
+# model = "text-embedding-3-small"  # any model your gateway serves
+# dimensions = 1536                 # optional — only sent when set
+# request_timeout_secs = 30
+
+# [webhook]
+# HTTP timeout (seconds) for governance / monitor webhook deliveries.
+# Override at runtime with OPEN_ONTOLOGIES_WEBHOOK_REQUEST_TIMEOUT_SECS.
+# request_timeout_secs = 10
+
+# [http]
+# Streamable HTTP transport (`open-ontologies serve-http`). CLI flags
+# (--host/--port/--token) and env vars (OPEN_ONTOLOGIES_HTTP_HOST,
+# OPEN_ONTOLOGIES_HTTP_PORT, OPEN_ONTOLOGIES_TOKEN) take precedence.
+# host = "127.0.0.1"
+# port = 8080
+# token = ""             # empty disables auth
+# stateful_mode = true   # rmcp StreamableHttpServer per-session state
+# request_timeout_secs = 0   # 0 = rmcp default
+# keep_alive_secs = 0        # 0 = rmcp default
+
+# [monitor]
+# Continuous watcher loop. CLI `--watch` / `--watch-interval` override.
+# enabled = false
+# interval_secs = 30
+
+# [reasoner]
+# Safety limits for the OWL-DL tableaux reasoner and RDFS / OWL-RL fixpoint.
+# tableaux_max_depth = 100
+# tableaux_max_nodes = 10000
+# max_iterations = 64
+# Wall clocks. NOTE the different meaning of 0: for the three caps above 0 means
+# "unset, use the default", and for these two it means NO LIMIT, because a depth
+# cap of zero is not a configuration anybody wants and a timeout of zero is.
+# tableaux_test_timeout_ms = 10000    # one PHASE of a run
+# classify_timeout_ms = 180000        # ceiling for the WHOLE run (ORE's 180s)
+# A run has five phases (consistency, satisfiability, subsumption, ABox,
+# explanation), each opening one phase budget, so at these defaults the ceiling
+# cannot be the bound that fires: 5 x 10000 = 50000, well under 180000. Lower it
+# below that to make it the binding one. Every `owl-dl` run reports which of the
+# two is binding, in `budget.binding_bound`, with a sentence saying why.
+
+# [feedback]
+# Lint / enforce self-calibration thresholds (number of dismissals before
+# downgrading then suppressing a (tool, rule_id, entity) triple). Suppressed
+# issues are listed in the output's `suppressed[]`; errors are never touched.
+# suppress_threshold = 3
+# downgrade_threshold = 2
+
+# [imports]
+# `owl:imports` resolution policy used by `onto_import`.
+# max_depth = 3
+# request_timeout_secs = 30
+# follow_remote = true   # set false in air-gapped / sandboxed deployments
+
+# [repo]
+# Defaults for the `onto_repo_list` tool.
+# default_list_limit = 1000
+
+# [socket]
+# Defaults for the `serve-unix` subcommand. CLI `--socket` / `--file`
+# override these.
+# enabled = false
+# path = "/tmp/tardygrada-ontology-complete.sock"
+# preload_files = []
+
+# [logging]
+# Tracing subscriber configuration. RUST_LOG, when set, takes precedence.
+# level = "info"
+# format = "compact"     # "compact" | "pretty" | "json"
+# # file = "/var/log/open-ontologies.log"
+"#;
+
+/// The default for `--data-dir`, named so the server arms can tell an explicit
+/// `--data-dir` from an unset one and give the flag precedence over config.
+const DEFAULT_DATA_DIR: &str = "~/.open-ontologies";
+
+#[derive(Parser)]
+#[command(
+    name = "open-ontologies",
+    about = "Terraform for Knowledge Graphs — AI-native ontology engine"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+
+    /// Output results as JSON. This is the default; the flag is accepted so
+    /// that scripts can state the format they depend on rather than assume it.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Render results as human-readable text instead of JSON. Overridden by
+    /// --json or --pretty when both are given.
+    #[arg(long, global = true)]
+    human: bool,
+
+    /// Pretty-print JSON output (implies --json)
+    #[arg(long, global = true)]
+    pretty: bool,
+
+    /// Data directory (default: ~/.open-ontologies)
+    #[arg(long, global = true, default_value = DEFAULT_DATA_DIR)]
+    data_dir: String,
+
+    /// Force local execution — ignore a running daemon even if one is detected
+    #[arg(long, global = true)]
+    no_connect: bool,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize data directory, DB, and default config
+    Init {
+        #[arg(long, default_value = "~/.open-ontologies")]
+        data_dir: String,
+        /// Custom ONNX model URL (default: multilingual MiniLM-L12-v2 from Hugging Face)
+        #[arg(long)]
+        model_url: Option<String>,
+        /// Custom tokenizer URL (default: multilingual MiniLM-L12-v2 tokenizer from Hugging Face)
+        #[arg(long)]
+        tokenizer_url: Option<String>,
+        /// Filename for the downloaded ONNX model (default: paraphrase-multilingual-MiniLM-L12-v2.onnx)
+        #[arg(long)]
+        model_name: Option<String>,
+    },
+    /// Start the MCP server (stdio transport)
+    Serve {
+        #[arg(long, default_value = "~/.open-ontologies/config.toml")]
+        config: String,
+        /// Optional governance webhook URL (fires on every lineage event)
+        #[arg(long, env = "GOVERNANCE_WEBHOOK")]
+        governance_webhook: Option<String>,
+        /// Enable continuous background monitoring (runs watchers on an interval).
+        /// When omitted, falls back to `[monitor] enabled` from the config (default false).
+        #[arg(long)]
+        watch: bool,
+        /// Interval in seconds between monitor sweeps. When omitted, falls back to
+        /// `OPEN_ONTOLOGIES_MONITOR_INTERVAL_SECS` env var, then `[monitor] interval_secs`
+        /// from the config (default 30).
+        #[arg(long)]
+        watch_interval: Option<u64>,
+        /// Comma-separated list of tools (or `@group`) to allow. Mutually exclusive with --tools-deny.
+        #[arg(long)]
+        tools_allow: Option<String>,
+        /// Comma-separated list of tools (or `@group`) to deny.
+        #[arg(long)]
+        tools_deny: Option<String>,
+        /// Task profile: the named subset of the tool surface to advertise.
+        /// `full` (default, every tool) or one of `authoring`, `validation`,
+        /// `reasoning`, `alignment`, `governance`, `data`, `planning`,
+        /// `retrieval`, `evaluation`. An unknown name refuses to start.
+        /// CLI > `OPEN_ONTOLOGIES_TOOL_PROFILE` env > `[tools] profile`.
+        #[arg(long)]
+        tool_profile: Option<String>,
+        /// Idle TTL in seconds before the active ontology is unloaded from memory. 0 disables eviction.
+        #[arg(long)]
+        idle_ttl_secs: Option<u64>,
+        /// When set, every read tool checks the source file for changes and recompiles.
+        #[arg(long)]
+        auto_refresh: bool,
+        /// Storage backend for the main triple store: `memory` (default,
+        /// in-memory) or `persistent` (RocksDB at `<data_dir>/triplestore`).
+        /// CLI > `OPEN_ONTOLOGIES_STORAGE_MODE` env > `[storage] mode`.
+        #[arg(long)]
+        storage_mode: Option<String>,
+    },
+    /// Start the MCP server (Streamable HTTP transport)
+    ServeHttp {
+        #[arg(long, default_value = "~/.open-ontologies/config.toml")]
+        config: String,
+        /// Host to bind to. CLI > `OPEN_ONTOLOGIES_HTTP_HOST` env > `[http] host`
+        /// in config > `127.0.0.1`.
+        #[arg(long)]
+        host: Option<String>,
+        /// Port to bind to. CLI > `OPEN_ONTOLOGIES_HTTP_PORT` env > `[http] port` >
+        /// `8080`.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Optional bearer token for authentication. CLI > `OPEN_ONTOLOGIES_TOKEN`
+        /// env > `[http] token` in config.
+        #[arg(long, env = "OPEN_ONTOLOGIES_TOKEN")]
+        token: Option<String>,
+        /// Optional governance webhook URL (fires on every lineage event)
+        #[arg(long, env = "GOVERNANCE_WEBHOOK")]
+        governance_webhook: Option<String>,
+        /// Enable continuous background monitoring (runs watchers on an interval).
+        /// When omitted, falls back to `[monitor] enabled` from the config (default false).
+        #[arg(long)]
+        watch: bool,
+        /// Interval in seconds between monitor sweeps. When omitted, falls back to
+        /// `[monitor] interval_secs` from the config (default 30).
+        #[arg(long)]
+        watch_interval: Option<u64>,
+        /// Comma-separated list of tools (or `@group`) to allow.
+        #[arg(long)]
+        tools_allow: Option<String>,
+        /// Comma-separated list of tools (or `@group`) to deny.
+        #[arg(long)]
+        tools_deny: Option<String>,
+        /// Task profile: the named subset of the tool surface to advertise.
+        /// `full` (default, every tool) or one of `authoring`, `validation`,
+        /// `reasoning`, `alignment`, `governance`, `data`, `planning`,
+        /// `retrieval`, `evaluation`. An unknown name refuses to start.
+        /// CLI > `OPEN_ONTOLOGIES_TOOL_PROFILE` env > `[tools] profile`.
+        #[arg(long)]
+        tool_profile: Option<String>,
+        /// Idle TTL in seconds before the active ontology is unloaded from memory.
+        #[arg(long)]
+        idle_ttl_secs: Option<u64>,
+        /// When set, every read tool checks the source file for changes and recompiles.
+        #[arg(long)]
+        auto_refresh: bool,
+        /// Storage backend for the main triple store: `memory` (default,
+        /// in-memory) or `persistent` (RocksDB at `<data_dir>/triplestore`).
+        /// CLI > `OPEN_ONTOLOGIES_STORAGE_MODE` env > `[storage] mode`.
+        #[arg(long)]
+        storage_mode: Option<String>,
+    },
+
+    /// Start unix socket server for Tardygrada fact grounding
+    #[cfg(unix)]
+    ServeUnix {
+        #[arg(long, default_value = "~/.open-ontologies/config.toml")]
+        config: String,
+        /// Path to the unix socket. CLI > `[socket] path` in config >
+        /// `/tmp/tardygrada-ontology-complete.sock`.
+        #[arg(long)]
+        socket: Option<String>,
+        /// Ontology files to load on startup. When omitted, falls back to
+        /// `[socket] preload_files` from the config.
+        #[arg(long = "file", num_args = 1..)]
+        files: Vec<String>,
+    },
+    /// Unix socket transport is not available on Windows.
+    #[cfg(windows)]
+    ServeUnix {
+        #[arg(long, default_value = "~/.open-ontologies/config.toml")]
+        config: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long = "file", num_args = 1..)]
+        files: Vec<String>,
+    },
+
+    // ─── Batch ────────────────────────────────────────────────────
+    /// Run a batch of commands from a file or stdin (one per line, or JSON array)
+    Batch {
+        /// Path to batch file (use - for stdin)
+        #[arg(default_value = "-")]
+        input: String,
+        /// Stop on first error
+        #[arg(long)]
+        bail: bool,
+    },
+
+    // ─── Daemon ───────────────────────────────────────────────────
+    /// Manage background daemon (persistent in-memory store via serve-http)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
+    // ─── Core ontology ────────────────────────────────────────────
+    /// Validate RDF/OWL syntax (file or stdin with -)
+    Validate { input: String },
+    /// Load RDF file into in-memory graph store
+    Load { path: String },
+    /// Save ontology to file
+    Save {
+        path: String,
+        #[arg(long, default_value = "turtle")]
+        format: String,
+    },
+    /// Clear in-memory store
+    Clear,
+    /// Show triple count, classes, properties, individuals
+    Stats,
+    /// Run SPARQL query (or stdin with -)
+    Query { query: String },
+    /// Compare two ontology files
+    Diff { old_path: String, new_path: String },
+    /// Lint: check for missing labels, domains, ranges
+    Lint { input: String },
+    /// Defects: check the ONTOLOGY against itself, before any data is judged by it
+    Defects { input: String },
+    /// Convert between RDF formats, or to OWL 2 functional syntax (`--to ofn`)
+    Convert {
+        path: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Server health and loaded triple count
+    Status,
+
+    // ─── Remote ───────────────────────────────────────────────────
+    /// Fetch ontology from URL or SPARQL endpoint
+    Pull {
+        url: String,
+        #[arg(long)]
+        sparql: bool,
+        #[arg(long)]
+        query: Option<String>,
+    },
+    /// Push ontology to SPARQL endpoint
+    Push {
+        endpoint: String,
+        #[arg(long)]
+        graph: Option<String>,
+    },
+    /// Browse and install standard ontologies from marketplace
+    Marketplace {
+        /// Action: "list" or "install"
+        action: String,
+        /// Ontology ID (for install)
+        #[arg(long)]
+        id: Option<String>,
+        /// Filter by domain (for list)
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Resolve and load owl:imports chain
+    ImportOwl {
+        #[arg(long, default_value = "10")]
+        max_depth: usize,
+    },
+
+    // ─── Versioning ───────────────────────────────────────────────
+    /// Save a named snapshot
+    Version { label: String },
+    /// List saved version snapshots
+    History,
+    /// Restore a previous version
+    Rollback { label: String },
+
+    // ─── Data pipeline ────────────────────────────────────────────
+    /// Generate mapping config from data file + ontology
+    Map {
+        data_path: String,
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long)]
+        save: Option<String>,
+    },
+    /// Ingest structured data into RDF
+    Ingest {
+        path: String,
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long)]
+        mapping: Option<String>,
+        #[arg(long)]
+        base_iri: Option<String>,
+    },
+    /// Validate against SHACL shapes
+    ///
+    /// Exit code: 0 conforms, 1 does not conform or failed, 2 not determined
+    /// (`conforms: null`).
+    Shacl {
+        shapes: String,
+        /// Validate the snapshot that was TRUE at this instant (#108). Read as
+        /// an instant on the UTC timeline, like `temporal-snapshot --valid-at`.
+        #[arg(long)]
+        valid_at: Option<String>,
+        /// Validate the snapshot that was KNOWN at this instant.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Validate every version at once over a store that has versions. A
+        /// different question from any snapshot's, so it is said out loud;
+        /// refused together with --valid-at or --as-of.
+        #[arg(long)]
+        all_versions: bool,
+        /// Run the VERIFIED evaluator, `oo-shacl`, whose agreement with the
+        /// SHACL Recommendation is the machine-checked theorem
+        /// `Shacl.validate_spec`, instead of the SPARQL-compiling one.
+        ///
+        /// A different question, not a better setting on the same one. It
+        /// covers SHACL Core and refuses `sh:sparql` and user-defined
+        /// components outright; the default path runs those and skips others,
+        /// so neither is a superset. Its report carries a `verified` key the
+        /// default path never emits, and `undetermined` is a first-class
+        /// answer there rather than a silent omission.
+        ///
+        /// Refused together with --valid-at, --as-of and --all-versions: the
+        /// verified evaluator has no temporal scope, so honouring one is
+        /// impossible and dropping it would answer a different question.
+        #[arg(long)]
+        verified: bool,
+        /// `json`, `turtle` or `ntriples`. The RDF forms are a W3C
+        /// `sh:ValidationReport` graph. An undetermined run is written
+        /// `sh:conforms false` plus `oo:undetermined true`, and the exit code
+        /// is taken from the verdict, never from the text, so it is the same
+        /// in every format.
+        #[arg(long, default_value = "json")]
+        report_format: String,
+    },
+    /// Closed-world vocab check: flag data terms not declared in the loaded ontology
+    VocabCheck { data: String },
+    /// Run inference (rdfs, owl-rl, owl-rl-ext, owl-dl)
+    Reason {
+        #[arg(long, default_value = "rdfs")]
+        profile: String,
+        /// Write a derivation certificate (asserted.tsv + derivations.tsv)
+        /// to this directory. `lean/` holds a checker for it whose soundness
+        /// is a machine-checked theorem; see docs/lean-certificates.md.
+        ///
+        /// When the run also finds a contradiction that the checker can judge,
+        /// a refutation.tsv lands here too, for `lake exe oo-refute check`.
+        /// Ten clash rules are certifiable and written; the rest are reported
+        /// in the response as found by this engine, with nothing written for
+        /// them. The Lean checker holds conditions for twelve, and the two
+        /// it can check that this engine never finds are named in
+        /// `CLASH_RULES_NOT_DETECTED`.
+        #[arg(long)]
+        certificate: Option<String>,
+        /// Evaluate a SUPPLIED Horn rule table instead of a built-in profile,
+        /// in the `rules.tsv` format `oo-horn` reads (`oo-horn rules` prints
+        /// the built-in table in it). Requires --certificate, because a run
+        /// over rules nobody has checked reports nothing about what it proved:
+        /// the certificate is the output, and `oo-horn check` is what
+        /// pronounces on it. --profile is not run alongside it; the supplied
+        /// table is the whole rule set for the run. Nothing is materialised.
+        #[arg(long)]
+        rules: Option<String>,
+        /// Reason over the snapshot that was TRUE at this instant (#108).
+        /// Passing any temporal scope argument makes the run a DRY one:
+        /// nothing may be written into a versioned store.
+        #[arg(long)]
+        valid_at: Option<String>,
+        /// Reason over the snapshot that was KNOWN at this instant.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Reason over every version at once over a store that has versions;
+        /// refused together with --valid-at or --as-of.
+        #[arg(long)]
+        all_versions: bool,
+    },
+    /// Export the loaded ontology as first-order logic, for a prover or a model finder
+    ///
+    /// The translation is the one owl-lean's machine-checked adequacy theorem
+    /// (`OwlLean.adequacy`) is about. The correspondence between this emitter
+    /// and that Lean is PINNED BY TESTS AND NOT ITSELF PROVED, and a prover's
+    /// verdict on the output is an oracle opinion, never a certificate. A
+    /// MODEL is the other case: see `fol-model`.
+    Fol {
+        /// Output directory. `ontology.p`, `.clif`, `.cgif`, `.smt2` or `.in`
+        /// lands here, plus one problem per goal under `goals/` when --goals is
+        /// given. Every run also writes `problem.tsv`, the format the verified
+        /// checker `oo-folmodel` reads, with its digest in the report.
+        #[arg(long)]
+        out: String,
+        /// `tptp` (FOF, what provers read), `cnf` (the same theory already in clauses, so a
+        /// prover's refutation can be checked by `oo-resolution`; refused outside OWL 2 RL's clausal
+        /// fragment), `clif` or `cgif` (two of ISO/IEC
+        /// 24707 Common Logic's three dialects, both restricted to the
+        /// first-order-equivalent fragment), `smtlib` (SMT-LIB 2, what Z3
+        /// reads) or `ladr` (what Mace4 reads, with every symbol MANGLED and
+        /// the table in `symbols.tsv`).
+        ///
+        /// `cgif` is CORE CGIF in the compact sub-dialect clause 7.1.1 names:
+        /// no sequence markers, which is what clause 6.5 says takes Common
+        /// Logic past first order. It takes no dialect or comment flag.
+        ///
+        /// The last two assert the NEGATED goal rather than declaring a
+        /// conjecture, because they are read by model finders and a
+        /// countermodel to `G |= phi` is a model of `G + {not phi}`.
+        #[arg(long, default_value = "tptp")]
+        format: String,
+        /// With --format smtlib: the carrier size. Omitted gives the UNBOUNDED
+        /// encoding, where `unsat` really is unsatisfiability. Given `k`, the
+        /// carrier is an enumeration datatype of exactly k elements, a `sat`
+        /// comes with a structure `oo-folmodel` can check, and an `unsat`
+        /// establishes only that no model of size k exists.
+        #[arg(long)]
+        smt_domain: Option<u32>,
+        /// With --format clif: `iso` (default, `cl:text`, what ISO/IEC 21838-2
+        /// publishes BFO in) or `colore` (`cl-text`, what COLORE and the
+        /// Macleod toolchain read; Macleod cannot read the ISO spelling).
+        #[arg(long, default_value = "iso")]
+        clif_dialect: String,
+        /// With --format clif: `standalone` (default) puts each label in its
+        /// own `(cl:comment '...')` phrase and the sentence bare, or `wrapped`
+        /// for `(cl:comment '...' SENTENCE)`, the shape BFO uses. Wrapped is
+        /// correct CLIF that both existing CLIF parsers read as EMPTY.
+        #[arg(long, default_value = "standalone")]
+        clif_comments: String,
+        /// A TSV of triples to ask as conjectures, one problem per line.
+        /// `derivations.tsv` from `reason --certificate` is the intended
+        /// input; pass --goals-skip-columns 1 for it, because its first
+        /// column is the rule name.
+        #[arg(long)]
+        goals: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        goals_skip_columns: usize,
+    },
+
+    /// Read rules written in a STANDARD rule syntax into the `rules.tsv` table
+    /// `reason --rules` evaluates and `oo-horn check` verifies.
+    ///
+    /// Every rule imported is a rule you wrote, so a certificate over the table
+    /// this produces can only ever earn `entailed_under_supplied_rules`: true in
+    /// every model of the asserted graph THAT ALSO SATISFIES YOUR RULES. The
+    /// rules are assumed and never checked.
+    RulesImport {
+        /// `swrl` for SWRL rules encoded in RDF, `rif` for RIF Core in its XML
+        /// syntax. Only part of each language is representable as Horn rules
+        /// over triple patterns; the response states the exact fragment and
+        /// names every rule it refused.
+        #[arg(long)]
+        from: String,
+        /// The document to read. Required for `rif`. Optional for `swrl`:
+        /// without it the LOADED graph is read; with it the file is parsed into
+        /// a store of its own, so importing rules never changes what is loaded.
+        #[arg(long)]
+        file: Option<String>,
+        /// Where to write the table. Without it nothing is written and the
+        /// table comes back in the response under `rules_tsv`.
+        #[arg(long)]
+        out: Option<String>,
+        /// Import the rules that CAN be represented even though others cannot.
+        /// Off by default, and deliberately: a table that quietly lost a rule
+        /// still reaches a fixpoint and still produces a certificate that
+        /// checks green, which is a sound proof about a rule set nobody wrote.
+        /// With this flag the import succeeds, the result carries
+        /// `certifies_a_weaker_rule_set: true`, and every lost rule is named.
+        #[arg(long)]
+        allow_partial: bool,
+    },
+
+    /// Find a finite model and CHECK it, for a verdict that says what it rests on
+    ///
+    /// Export, run Z3 or Mace4, read the structure back, and hand it to the
+    /// verified checker `oo-folmodel`. Only the verdict `model_checked` rests
+    /// on a machine-checked theorem (`Fol.satisfiable_of_check`). A solver's
+    /// `unsat` is an ORACLE OPINION and can never be more, and an exhausted
+    /// BOUNDED search is `no_model_up_to_size_k`, which is not
+    /// unsatisfiability. Exits 1 if any run is a stop-the-line disagreement.
+    FolModel {
+        /// Working directory. Every intermediate file lands here, so a run is
+        /// reproducible by hand from what it leaves behind.
+        #[arg(long)]
+        out: String,
+        /// `z3` (SMT-LIB, and the only one that can be asked the UNBOUNDED
+        /// question) or `mace4` (LADR, a dedicated finite model finder whose
+        /// minimum carrier is 2).
+        #[arg(long, default_value = "z3")]
+        solver: String,
+        /// The largest carrier the ladder tries. The default is from the
+        /// measured cost of the compiled checker: about 9M evaluation points
+        /// per second, cubic in the carrier at quantifier depth 3.
+        #[arg(long, default_value_t = 16)]
+        max_domain: u32,
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u32,
+        /// After a bounded ladder finds nothing, ask the UNBOUNDED question
+        /// too. This is the ONLY route to `unsatisfiable_oracle`. Z3 only.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        unbounded_probe: bool,
+        /// A TSV of triples to ask as conjectures, one run per line, the same
+        /// shape `fol --goals` takes.
+        #[arg(long)]
+        goals: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        goals_skip_columns: usize,
+        /// Path to `oo-folmodel`. Defaults to `lean/.lake/build/bin/` then
+        /// `$PATH`; its absence is reported loudly and never worked around.
+        #[arg(long)]
+        checker: Option<String>,
+    },
+
+    /// Run a prover, READ the derivation it prints, and re-check what can be re-checked
+    ///
+    /// A refutation is still an ORACLE OPINION (decision 0005) and nothing
+    /// here certifies one. What this adds is that the opinion stops being a
+    /// single word: the derivation is parsed, every leaf is matched against
+    /// the problem THIS engine emitted, the DAG is checked for dangling
+    /// parents and cycles, and the resolution-family steps are recomputed from
+    /// their premises. Every rule that was not replayed is named and counted.
+    /// Exits 1 if any derivation is rejected or any implemented step fails to
+    /// reconstruct.
+    FolProve {
+        /// Working directory. The problem, the prover's raw output and the
+        /// report land here, so a run is reproducible by hand.
+        #[arg(long, required_unless_present = "problem")]
+        out: Option<String>,
+        /// `vampire` (default) or `eprover`. Both are run WITH their
+        /// proof-printing option, because a run without one returns a word
+        /// and no derivation.
+        #[arg(long, default_value = "vampire")]
+        prover: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u32,
+        /// A TSV of triples to ask as conjectures, one run per line; the shape
+        /// `fol --goals` takes.
+        #[arg(long)]
+        goals: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        goals_skip_columns: usize,
+        /// CHECK-ONLY: a TPTP problem file. With --proof, no prover is run and
+        /// no store is read; the recorded pair is checked as it stands. This
+        /// is what tools/fol_differential.py calls.
+        #[arg(long, requires = "proof")]
+        problem: Option<String>,
+        /// CHECK-ONLY: a file holding a prover's output for --problem.
+        #[arg(long, requires = "problem")]
+        proof: Option<String>,
+    },
+
+    /// Ask whether a retrieved slice still supports the claims an answer rests on
+    ///
+    /// Coverage is a proxy. This asks the property: for each goal, does the
+    /// projection entail it exactly when the source does, with a machine-checked
+    /// certificate for each one it preserves. Exits 1 if any goal was lost,
+    /// ungrounded or refused, 2 on a stop-the-line disagreement.
+    Preserve {
+        /// The slice as Turtle. Blank nodes are relabelled on re-parse, so
+        /// subsethood is then decided over ground triples only and the
+        /// monotonicity differential is disarmed.
+        #[arg(long, conflicts_with = "projection_graph")]
+        projection: Option<String>,
+        /// A named graph of the LOADED store holding the slice. Blank node
+        /// identity survives, so `P ⊆ G` can hold by construction and the
+        /// differential can be armed.
+        #[arg(long)]
+        projection_graph: Option<String>,
+        /// Turtle in which every triple is a goal, or a TSV with
+        /// --goals-skip-columns. `derivations.tsv` from `reason --certificate`
+        /// is a valid input with --goals-skip-columns 1.
+        #[arg(long)]
+        goals: String,
+        #[arg(long, default_value_t = 0)]
+        goals_skip_columns: usize,
+        /// One profile for BOTH runs. Two profiles compare two rule sets and
+        /// the differential then fires on nothing at all.
+        #[arg(long, default_value = "owl-rl")]
+        profile: String,
+        /// A SUPPLIED Horn table instead of a built-in profile. Its presence
+        /// changes the verdict WORD for every preserved goal.
+        #[arg(long)]
+        rules: Option<String>,
+        /// Where the two certificates and the per-goal slices land.
+        #[arg(long)]
+        out: String,
+        /// Seeds for the demoted coverage proxy. Independent of --goals.
+        #[arg(long)]
+        seed: Vec<String>,
+        #[arg(long)]
+        checker: Option<String>,
+        /// Turn an absent checker into a failure. The CI leg sets it.
+        #[arg(long, default_value_t = false)]
+        require_checker: bool,
+    },
+    /// Which CONCLUSIONS a projection preserves, with no goals supplied
+    ///
+    /// The offline form, for auditing a retrieval STRATEGY rather than one
+    /// answer: reason both graphs to a fixpoint under the same table and report
+    /// `closure(G) \ closure(P)`. Exits 1 when something in the projection's own
+    /// vocabulary was lost, 2 on a monotonicity violation.
+    ClosureDiff {
+        /// The slice as Turtle.
+        #[arg(long)]
+        projection: String,
+        /// Where both certificates and the report land.
+        #[arg(long)]
+        out: String,
+        #[arg(long, default_value = "owl-rl-ext")]
+        profile: String,
+        /// Replace every source blank node with a Skolem IRI before diffing.
+        /// Without it, every triple touching a blank node lands in
+        /// `not_compared` and the monotonicity gate is suppressed for it.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        skolemise_source: bool,
+        #[arg(long)]
+        checker: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        max_rows: usize,
+        /// Seeds for the demoted coverage proxy.
+        #[arg(long)]
+        seed: Vec<String>,
+    },
+
+    /// Label each step of a reasoning trace against the rule table
+    ///
+    /// Three answers per step and the third is the one to read: `entailed`,
+    /// `not_entailed`, and `outside_the_fragment`, which says the rule table
+    /// could never have produced that conclusion however much data arrived. A
+    /// trace over a SUPPLIED rule table can only ever earn
+    /// `entailed_under_supplied_rules_checked`, and the report carries the
+    /// digest of the table that was in force. Exits 1 when any step is not
+    /// entailed, 2 when a certificate was rejected.
+    TraceLabel {
+        /// The trace, in `oo-trace/1`: one step per line, `rule TAB conclusion
+        /// TAB premise*`, each triple three tab-separated N-Triples terms. A
+        /// `derivations.tsv` from `reason --certificate` is a valid trace.
+        #[arg(long)]
+        trace: String,
+        #[arg(long, default_value = "owl-rl")]
+        profile: String,
+        /// A supplied Horn table in the `rules.tsv` format `oo-horn` reads.
+        #[arg(long)]
+        rules: Option<String>,
+        /// Where the run certificate, the per-step certificates and
+        /// `labels.jsonl` land. Every file stays, so a label is reproducible.
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        checker: Option<String>,
+        /// Turn an absent Lean checker into an error instead of an honest
+        /// `entailed_unchecked` label.
+        #[arg(long, default_value_t = false)]
+        require_checker: bool,
+    },
+    /// Full pipeline: ingest → SHACL → reason
+    Extend {
+        data_path: String,
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long)]
+        mapping: Option<String>,
+        #[arg(long)]
+        shapes: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+    },
+
+    // ─── Lifecycle ────────────────────────────────────────────────
+    /// Plan changes: diff current vs proposed Turtle
+    Plan {
+        file: String,
+        /// Skip the conservativity check, which is the only part of a plan
+        /// that is about MEANING and is ON by default since #196. It reasons
+        /// both graphs to a fixpoint, about 11 microseconds an individual, so
+        /// this is the thing to reach for on a store big enough that it hurts.
+        #[arg(long)]
+        no_conservativity: bool,
+    },
+    /// Apply planned changes (safe or migrate)
+    Apply {
+        #[arg(default_value = "safe")]
+        mode: String,
+        /// Plan to apply, as printed by `plan`. Defaults to the most recent plan.
+        #[arg(long)]
+        plan_id: Option<String>,
+    },
+    /// Lock IRIs to prevent removal
+    Lock {
+        iris: Vec<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Detect drift between two ontology versions
+    Drift { file_a: String, file_b: String },
+    /// Run design pattern enforcement
+    ///
+    /// Exit code: 0 no error-severity violation, 1 at least one, or failed.
+    Enforce {
+        #[arg(default_value = "generic")]
+        pack: String,
+    },
+    /// Load a pack, refusing it if a digest does not match, and re-run the Lean
+    /// checker over the certificate the pack carries.
+    ///
+    /// The four answers this can give are kept apart: the pack carries no
+    /// certificate; the certificate was accepted; it was REFUSED, which stops
+    /// the load; or this build has no checker, so nothing was checked. The last
+    /// one is not a pass.
+    ///
+    /// Exit code: 0 accepted or no certificate, 1 refused, unreadable, not
+    /// about this pack, or failed, 2 nothing was checked.
+    ///
+    /// `pack` stays MCP-only and this does not, on purpose. The receiver is the
+    /// party this exists for, and requiring them to run an MCP client to audit
+    /// a pack would defeat it.
+    Unpack {
+        /// Pack to read
+        path: String,
+        /// Report without loading
+        #[arg(long)]
+        verify_only: bool,
+        /// Skip the checker. Reports `checker_absent_nothing_was_checked`.
+        #[arg(long)]
+        no_check: bool,
+        /// Path to oo-cert or oo-horn
+        #[arg(long)]
+        checker: Option<String>,
+        /// Keep the unpacked certificate here so the check can be repeated
+        #[arg(long)]
+        certificate_out: Option<String>,
+        /// Load the graph even when its certificate was refused
+        #[arg(long)]
+        load_even_if_refused: bool,
+    },
+    /// Run active SPARQL watchers
+    ///
+    /// Exit code: 1 when a watcher blocked the next apply or rolled back, else 0.
+    Monitor,
+    /// Clear monitor block state
+    MonitorClear,
+    /// View lineage trail
+    Lineage {
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    // ─── Alignment ────────────────────────────────────────────────
+    /// Detect alignment candidates between two ontologies
+    Align {
+        /// Source ontology file
+        source: String,
+        /// Target ontology file (if omitted, aligns against loaded store)
+        target: Option<String>,
+        /// Minimum confidence threshold (default 0.95, or 0.85 with
+        /// `--scoring legacy`, which is the same strictness on each scale)
+        #[arg(long)]
+        min_confidence: Option<f64>,
+        /// Dry run — show candidates without inserting triples
+        #[arg(long)]
+        dry_run: bool,
+        /// How the weighted sum becomes a confidence: `informative` (default:
+        /// the weighted mean over the signals both sides carry data for) or
+        /// `legacy` (the fusion the published OAEI figures were measured with)
+        #[arg(long, default_value = "informative")]
+        scoring: String,
+        /// `one-to-one` (default) keeps one row per source and per target;
+        /// `many-to-one` lets several source terms map to one target, for a
+        /// source list finer than its target
+        #[arg(long, default_value = "one-to-one")]
+        cardinality: String,
+    },
+    /// Carry a crosswalk's claims into the target and report any clash
+    ///
+    /// The source's entailed subsumptions are translated through the mapping
+    /// (an SSSOM TSV) and reasoned together with the target's axioms. A clash
+    /// the carried claims ADD means the target denies what the mapping says:
+    /// a wrong row, or two ontologies that disagree. One witness individual is
+    /// typed into each receiving class so a TBox-only taxonomy can clash at
+    /// all, and clashes the target has on its own are reported apart. Exits 1
+    /// when the mapping adds a clash. The same check runs in `batch` as
+    /// `crosswalk-probe`.
+    CrosswalkProbe {
+        /// The ontology the mapping's subjects come from
+        source: String,
+        /// The ontology the mapping's objects come from
+        target: String,
+        /// The crosswalk, as SSSOM TSV (subject_id, predicate_id, object_id)
+        mappings: String,
+    },
+    /// Accept or reject an alignment candidate
+    AlignFeedback {
+        /// Source class IRI
+        #[arg(long)]
+        source: String,
+        /// Target class IRI
+        #[arg(long)]
+        target: String,
+        /// Accept the candidate
+        #[arg(long, conflicts_with = "reject")]
+        accept: bool,
+        /// Reject the candidate
+        #[arg(long, conflicts_with = "accept")]
+        reject: bool,
+    },
+
+    // ─── Feedback ────────────────────────────────────────────────
+    /// Accept or dismiss a lint issue
+    LintFeedback {
+        /// Lint rule ID (e.g. "missing_label", "missing_comment")
+        #[arg(long)]
+        rule_id: String,
+        /// Entity IRI that triggered the issue
+        #[arg(long)]
+        entity: String,
+        /// Accept the issue as valid
+        #[arg(long, default_value_t = false)]
+        accept: bool,
+        /// Dismiss/ignore the issue
+        #[arg(long, default_value_t = false)]
+        dismiss: bool,
+    },
+    /// Accept or dismiss an enforce violation
+    EnforceFeedback {
+        /// Enforce rule ID (e.g. "orphan_class", "missing_domain")
+        #[arg(long)]
+        rule_id: String,
+        /// Entity IRI that triggered the violation
+        #[arg(long)]
+        entity: String,
+        /// Accept the violation as valid
+        #[arg(long, default_value_t = false)]
+        accept: bool,
+        /// Dismiss/override the violation
+        #[arg(long, default_value_t = false)]
+        dismiss: bool,
+    },
+
+    // ─── Clinical ─────────────────────────────────────────────────
+    /// Look up clinical terminology crosswalk
+    Crosswalk {
+        code: String,
+        #[arg(long)]
+        system: String,
+    },
+    /// Add skos:exactMatch triple for clinical code
+    Enrich {
+        class_iri: String,
+        code: String,
+        #[arg(long)]
+        system: String,
+    },
+    /// Validate class labels against clinical terminology
+    ValidateClinical,
+
+    // ─── Schema import ────────────────────────────────────────────
+    /// Import database schema as OWL ontology (Postgres or DuckDB)
+    ImportSchema {
+        /// Connection string. Supported:
+        ///   postgres://user:pass@host/db (requires --features postgres)
+        ///   duckdb:///path/to/file.duckdb or *.duckdb file path (requires --features duckdb)
+        ///   :memory: for an in-memory DuckDB database
+        connection: String,
+        #[arg(long, default_value = "http://example.org/db/")]
+        base_iri: String,
+    },
+    /// Run a SQL query against a relational backbone (Postgres or DuckDB)
+    /// and ingest the result rows into the triple store as RDF.
+    SqlIngest {
+        /// Connection string (see import-schema for forms)
+        connection: String,
+        /// SQL SELECT to execute. Use `-` to read from stdin.
+        sql: String,
+        /// Path to mapping JSON, or inline JSON when --inline-mapping is set.
+        /// If omitted, an auto-mapping is generated from the column names.
+        #[arg(long)]
+        mapping: Option<String>,
+        /// Treat the value of --mapping as inline JSON instead of a file path.
+        #[arg(long)]
+        inline_mapping: bool,
+        /// Base IRI for generated instances
+        #[arg(long, default_value = "http://example.org/data/")]
+        base_iri: String,
+    },
+}
+
+impl Commands {
+    /// Serialize a proxy-able command into the structured form of `/api/batch`:
+    /// `{"command": name, "args": [..]}`, where every argument is its own array
+    /// element and reaches the daemon exactly as clap parsed it.
+    ///
+    /// The previous shape of this was a shell-ish line that the daemon
+    /// re-tokenized, and the round trip lost things. `parse_lines` splits on
+    /// newlines before it looks at quotes, so a multi-line SPARQL query — the
+    /// normal kind — arrived torn across lines and failed as an unterminated
+    /// quote, while the identical command run locally succeeded. The
+    /// double-quote fallback in the quoting helper did not escape backslashes,
+    /// so an argument holding both quote styles came out mangled. Neither can
+    /// happen to an array element.
+    ///
+    /// Returns None for commands that must always run locally (server modes,
+    /// daemon management, static file operations), and for any invocation
+    /// carrying a flag the batch handler cannot honour, which is safer than
+    /// proxying it and dropping the flag in silence.
+    fn to_batch_command(&self) -> Option<serde_json::Value> {
+        fn cmd(name: &str, args: Vec<String>) -> Option<serde_json::Value> {
+            Some(serde_json::json!({"command": name, "args": args}))
+        }
+        match self {
+            Commands::Load { path } => cmd("load", vec![absolutize(path)]),
+            Commands::Save { path, format } => cmd(
+                "save",
+                vec![absolutize(path), "--format".into(), format.clone()],
+            ),
+            Commands::Clear => cmd("clear", vec![]),
+            Commands::Stats => cmd("stats", vec![]),
+            Commands::Query { query } => cmd("query", vec![query.clone()]),
+            Commands::Lint { input } => cmd("lint", vec![absolutize(input)]),
+            Commands::Defects { input } => cmd("defects", vec![absolutize(input)]),
+            Commands::Reason {
+                profile,
+                certificate,
+                rules,
+                valid_at,
+                as_of,
+                all_versions,
+            } => {
+                let mut a = vec!["--profile".into(), profile.clone()];
+                if let Some(c) = certificate {
+                    a.push("--certificate".into());
+                    a.push(absolutize(c));
+                }
+                if let Some(r) = rules {
+                    a.push("--rules".into());
+                    a.push(absolutize(r));
+                }
+                if let Some(v) = valid_at {
+                    a.push("--valid-at".into());
+                    a.push(v.clone());
+                }
+                if let Some(v) = as_of {
+                    a.push("--as-of".into());
+                    a.push(v.clone());
+                }
+                if *all_versions {
+                    a.push("--all-versions".into());
+                }
+                cmd("reason", a)
+            }
+        Commands::Fol { out, format, smt_domain, clif_dialect, clif_comments, goals, goals_skip_columns } => {
+                let mut a = vec![
+                    "--out".into(),
+                    absolutize(out),
+                    "--format".into(),
+                    format.clone(),
+                    "--clif-dialect".into(),
+                    clif_dialect.clone(),
+                    "--clif-comments".into(),
+                    clif_comments.clone(),
+                ];
+                if let Some(k) = smt_domain {
+                    a.push("--smt-domain".into());
+                    a.push(k.to_string());
+                }
+                if let Some(g) = goals {
+                    a.push("--goals".into());
+                    a.push(absolutize(g));
+                    a.push("--goals-skip-columns".into());
+                    a.push(goals_skip_columns.to_string());
+                }
+                cmd("fol", a)
+            }
+
+            Commands::RulesImport { from, file, out, allow_partial } => {
+                // Proxied because `--from swrl` with no `--file` reads the
+                // LOADED graph, which lives in the daemon. Running it locally
+                // would read a different store and import a different rule set.
+                let mut a = vec!["--from".into(), from.clone()];
+                if let Some(f) = file {
+                    a.push("--file".into());
+                    a.push(absolutize(f));
+                }
+                if let Some(o) = out {
+                    a.push("--out".into());
+                    a.push(absolutize(o));
+                }
+                if *allow_partial {
+                    a.push("--allow-partial".into());
+                }
+                cmd("rules-import", a)
+            }
+
+            Commands::FolModel {
+                out,
+                solver,
+                max_domain,
+                timeout_secs,
+                unbounded_probe,
+                goals,
+                goals_skip_columns,
+                checker,
+            } => {
+                let mut a = vec![
+                    "--out".into(),
+                    absolutize(out),
+                    "--solver".into(),
+                    solver.clone(),
+                    "--max-domain".into(),
+                    max_domain.to_string(),
+                    "--timeout-secs".into(),
+                    timeout_secs.to_string(),
+                    "--unbounded-probe".into(),
+                    unbounded_probe.to_string(),
+                ];
+                if let Some(g) = goals {
+                    a.push("--goals".into());
+                    a.push(absolutize(g));
+                    a.push("--goals-skip-columns".into());
+                    a.push(goals_skip_columns.to_string());
+                }
+                if let Some(c) = checker {
+                    a.push("--checker".into());
+                    a.push(absolutize(c));
+                }
+                cmd("fol-model", a)
+            }
+
+            Commands::FolProve { out, prover, timeout_secs, goals, goals_skip_columns, problem, proof } => {
+                // The check-only pair reads two files and no store, so there
+                // is nothing for the daemon to hold and proxying it would only
+                // add a hop.
+                if problem.is_some() || proof.is_some() {
+                    return None;
+                }
+                let Some(out) = out else { return None };
+                let mut a = vec![
+                    "--out".into(),
+                    absolutize(out),
+                    "--prover".into(),
+                    prover.clone(),
+                    "--timeout-secs".into(),
+                    timeout_secs.to_string(),
+                ];
+                if let Some(g) = goals {
+                    a.push("--goals".into());
+                    a.push(absolutize(g));
+                    a.push("--goals-skip-columns".into());
+                    a.push(goals_skip_columns.to_string());
+                }
+                cmd("fol-prove", a)
+            }
+
+            Commands::Preserve {
+                projection,
+                projection_graph,
+                goals,
+                goals_skip_columns,
+                profile,
+                rules,
+                out,
+                seed,
+                checker,
+                require_checker,
+            } => {
+                let mut a = vec![
+                    "--goals".into(),
+                    absolutize(goals),
+                    "--goals-skip-columns".into(),
+                    goals_skip_columns.to_string(),
+                    "--profile".into(),
+                    profile.clone(),
+                    "--out".into(),
+                    absolutize(out),
+                ];
+                if let Some(p) = projection {
+                    a.push("--projection".into());
+                    a.push(absolutize(p));
+                }
+                if let Some(g) = projection_graph {
+                    a.push("--projection-graph".into());
+                    a.push(g.clone());
+                }
+                if let Some(r) = rules {
+                    a.push("--rules".into());
+                    a.push(absolutize(r));
+                }
+                for sd in seed {
+                    a.push("--seed".into());
+                    a.push(sd.clone());
+                }
+                if let Some(c) = checker {
+                    a.push("--checker".into());
+                    a.push(absolutize(c));
+                }
+                if *require_checker {
+                    a.push("--require-checker".into());
+                }
+                cmd("preserve", a)
+            }
+            Commands::ClosureDiff {
+                projection,
+                out,
+                profile,
+                skolemise_source,
+                checker,
+                max_rows,
+                seed,
+            } => {
+                let mut a = vec![
+                    "--projection".into(),
+                    absolutize(projection),
+                    "--out".into(),
+                    absolutize(out),
+                    "--profile".into(),
+                    profile.clone(),
+                    "--skolemise-source".into(),
+                    skolemise_source.to_string(),
+                    "--max-rows".into(),
+                    max_rows.to_string(),
+                ];
+                for sd in seed {
+                    a.push("--seed".into());
+                    a.push(sd.clone());
+                }
+                if let Some(c) = checker {
+                    a.push("--checker".into());
+                    a.push(absolutize(c));
+                }
+                cmd("closure-diff", a)
+            }
+            Commands::TraceLabel {
+                trace,
+                profile,
+                rules,
+                out,
+                checker,
+                require_checker,
+            } => {
+                let mut a = vec![
+                    "--trace".into(),
+                    absolutize(trace),
+                    "--profile".into(),
+                    profile.clone(),
+                    "--out".into(),
+                    absolutize(out),
+                ];
+                if let Some(r) = rules {
+                    a.push("--rules".into());
+                    a.push(absolutize(r));
+                }
+                if let Some(c) = checker {
+                    a.push("--checker".into());
+                    a.push(absolutize(c));
+                }
+                if *require_checker {
+                    a.push("--require-checker".into());
+                }
+                cmd("trace-label", a)
+            }
+            // The batch runner answers in JSON, so an RDF report runs locally
+            // rather than being proxied and coming back in the wrong format.
+            Commands::Shacl {
+                shapes,
+                valid_at,
+                as_of,
+                all_versions,
+                verified,
+                report_format,
+            } => {
+                if report_format != "json" {
+                    return None;
+                }
+                let mut a = vec![absolutize(shapes)];
+                if let Some(v) = valid_at {
+                    a.push("--valid-at".into());
+                    a.push(v.clone());
+                }
+                if let Some(v) = as_of {
+                    a.push("--as-of".into());
+                    a.push(v.clone());
+                }
+                if *all_versions {
+                    a.push("--all-versions".into());
+                }
+                if *verified {
+                    a.push("--verified".into());
+                }
+                cmd("shacl", a)
+            }
+            Commands::Status => cmd("status", vec![]),
+            Commands::Pull { url, sparql, query } => {
+                let mut a = vec![url.clone()];
+                if *sparql {
+                    a.push("--sparql".into());
+                }
+                if let Some(q) = query {
+                    a.push("--query".into());
+                    a.push(q.clone());
+                }
+                cmd("pull", a)
+            }
+            Commands::Push { endpoint, graph } => {
+                let mut a = vec![endpoint.clone()];
+                if let Some(g) = graph {
+                    a.push("--graph".into());
+                    a.push(g.clone());
+                }
+                cmd("push", a)
+            }
+            Commands::Version { label } => cmd("version", vec![label.clone()]),
+            Commands::History => cmd("history", vec![]),
+            Commands::Rollback { label } => cmd("rollback", vec![label.clone()]),
+            // `--format` has no arm in the batch ingester, so an invocation
+            // carrying it runs locally rather than being proxied without it.
+            Commands::Ingest { path, format, mapping, base_iri } => {
+                if format.is_some() {
+                    return None;
+                }
+                let mut a = vec![absolutize(path)];
+                if let Some(m) = mapping {
+                    a.push("--mapping".into());
+                    a.push(absolutize(m));
+                }
+                if let Some(b) = base_iri {
+                    a.push("--base-iri".into());
+                    a.push(b.clone());
+                }
+                cmd("ingest", a)
+            }
+            Commands::Plan { file, no_conservativity } => {
+                let mut a = vec![absolutize(file)];
+                if *no_conservativity {
+                    a.push("--no-conservativity".into());
+                }
+                cmd("plan", a)
+            }
+            Commands::Apply { mode, plan_id } => {
+                let mut a = vec![mode.clone()];
+                if let Some(p) = plan_id {
+                    a.push("--plan-id".into());
+                    a.push(p.clone());
+                }
+                cmd("apply", a)
+            }
+            Commands::Enforce { pack } => cmd("enforce", vec![pack.clone()]),
+            Commands::Monitor => cmd("monitor", vec![]),
+            Commands::MonitorClear => cmd("monitor-clear", vec![]),
+            Commands::Drift { file_a, file_b } => {
+                cmd("drift", vec![absolutize(file_a), absolutize(file_b)])
+            }
+            Commands::Lock { iris, reason } => {
+                let mut a: Vec<String> = iris.clone();
+                if let Some(r) = reason {
+                    a.push("--reason".into());
+                    a.push(r.clone());
+                }
+                cmd("lock", a)
+            }
+            Commands::Marketplace { action, id, domain } => {
+                let mut a = vec![action.clone()];
+                if let Some(i) = id {
+                    a.push("--id".into());
+                    a.push(i.clone());
+                }
+                if let Some(d) = domain {
+                    a.push("--domain".into());
+                    a.push(d.clone());
+                }
+                cmd("marketplace", a)
+            }
+            // Never proxied: server modes, daemon, init, validate, diff, convert,
+            // import-owl, map, extend, align, feedback, lineage, clinical, schema ops.
+            _ => None,
+        }
+    }
+}
+
+/// Make a path argument absolute against the caller's working directory before
+/// it is proxied.
+///
+/// The daemon inherits whatever directory `daemon start` ran in and never learns
+/// the caller's, so a relative path forwarded verbatim resolved against the wrong
+/// place: `cd /data && onto load ./x.ttl` either failed or loaded a different
+/// file, and `save ./out.ttl` wrote somewhere the caller was not looking. Not
+/// `canonicalize`, which requires the path to exist and so cannot be used for an
+/// output path that is about to be created.
+/// Hand `input` to a running daemon, or report that there is none to hand it to.
+///
+/// `Some(exit_code)` means the daemon ran it and the caller should exit with
+/// that code; `None` means run locally. Both proxy sites went through their own
+/// copy of this and the copies had already drifted — one hardcoded `bail` to
+/// false — so there is one copy now, and one place where the decision to proxy
+/// is made.
+async fn proxy_if_daemon(ctx: &ProxyCtx, input: &str, bail: bool) -> anyhow::Result<Option<i32>> {
+    if ctx.no_connect {
+        return Ok(None);
+    }
+    let Some(info) = open_ontologies::daemon::read_daemon_info(&ctx.data_dir) else {
+        return Ok(None);
+    };
+    if !open_ontologies::daemon::is_daemon_alive(info.pid) {
+        // Stale daemon.json — clean up silently and fall through to local.
+        open_ontologies::daemon::remove_daemon_info(&ctx.data_dir);
+        return Ok(None);
+    }
+    open_ontologies::connect::proxy_batch(&info, input, bail, json_mode(), ctx.pretty).await
+}
+
+/// The parts of `Cli` the proxy needs, taken before `cli.command` is matched by
+/// value and its fields move out.
+struct ProxyCtx {
+    no_connect: bool,
+    data_dir: String,
+    pretty: bool,
+}
+
+fn absolutize(path: &str) -> String {
+    let expanded = expand_tilde(path);
+    let p = std::path::Path::new(&expanded);
+    if p.is_absolute() {
+        return expanded;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p).to_string_lossy().into_owned(),
+        Err(_) => expanded,
+    }
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon (serve-http in background, persistent in-memory store)
+    Start {
+        /// Host to bind to (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind to (default: 8080)
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Optional bearer token for authentication
+        #[arg(long, env = "OPEN_ONTOLOGIES_TOKEN")]
+        token: Option<String>,
+    },
+    /// Stop the running daemon
+    Stop,
+    /// Show daemon status (pid, url, alive/dead)
+    Status,
+}
+
+fn setup(data_dir: &str) -> anyhow::Result<(StateDb, Arc<GraphStore>)> {
+    let data_dir = expand_tilde(data_dir);
+    let data_path = std::path::Path::new(&data_dir);
+    std::fs::create_dir_all(data_path)?;
+    let db_path = data_path.join("open-ontologies.db");
+    let db = StateDb::open(&db_path)?;
+    // One-shot CLI subcommands respect the same [storage] setting as the
+    // server modes (loaded from `<data_dir>/config.toml` if present). This is
+    // what makes `open-ontologies load foo.ttl` + `open-ontologies query ...`
+    // share state when persistence is enabled.
+    let cfg_path = data_path.join("config.toml");
+    let storage_cfg = open_ontologies::config::Config::load(&cfg_path)
+        .map(|c| c.storage)
+        .unwrap_or_default();
+    let graph = build_main_graph(&storage_cfg, data_path)?;
+    Ok((db, graph))
+}
+
+/// False only when --human is passed without --json or --pretty; checked by
+/// output_json/output_result.
+static JSON_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The resolved output format. Defaults to JSON on the paths that read it
+/// before `async_main` has set it, so no caller can fall into human-readable
+/// output by accident.
+fn json_mode() -> bool {
+    JSON_MODE.get().copied().unwrap_or(true)
+}
+/// Whether the resolved storage backend keeps the graph in RAM only.
+///
+/// One-shot CLI subcommands each build their own store, so in this mode nothing
+/// a command loads is visible to the next one.
+fn is_memory_storage(data_dir: &str) -> bool {
+    use open_ontologies::config::{resolve_storage_mode, StorageMode};
+    let data_path = std::path::PathBuf::from(expand_tilde(data_dir));
+    let storage_cfg = open_ontologies::config::Config::load(&data_path.join("config.toml"))
+        .map(|c| c.storage)
+        .unwrap_or_default();
+    matches!(resolve_storage_mode(&storage_cfg), StorageMode::Memory)
+}
+
+/// Build the singleton main graph using the configured storage backend.
+///
+/// In-memory: returns an empty `GraphStore`.
+/// Persistent: opens (or creates) a RocksDB-backed store at
+/// `<data_dir>/triplestore`.
+fn build_main_graph(
+    cfg: &open_ontologies::config::StorageConfig,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Arc<GraphStore>> {
+    use open_ontologies::config::{resolve_storage_mode, StorageMode};
+    match resolve_storage_mode(cfg) {
+        StorageMode::Memory => Ok(Arc::new(GraphStore::new())),
+        StorageMode::Persistent => {
+            let path = data_dir.join("triplestore");
+            let store = GraphStore::open_persistent(&path)?;
+            tracing::info!(
+                "opened persistent triple store at {} ({} triples)",
+                path.display(),
+                store.triple_count()
+            );
+            Ok(Arc::new(store))
+        }
+    }
+}
+
+fn output_json(value: &serde_json::Value, pretty: bool) {
+    if json_mode() || pretty {
+        if pretty {
+            println!("{}", serde_json::to_string_pretty(value).unwrap());
+        } else {
+            println!("{}", value);
+        }
+    } else {
+        println!("{}", open_ontologies::output::render_human(value));
+    }
+}
+
+/// Print a JSON string result, with optional pretty-printing.
+/// Handles the common pattern of domain functions returning String results.
+/// Print a tool result and fail the process if the payload carries an `error`.
+///
+/// `output_result` prints whatever it is handed and returns, so a command whose
+/// work failed still exited 0 while printing `{"error": ...}`. That is fine for a
+/// human reading the line and useless for a gate: `open-ontologies lint x.ttl ||
+/// exit 1` passed on exactly the input it exists to catch, because the shell was
+/// told success while the JSON said otherwise. Commands that can fail this way
+/// use this instead.
+fn output_result_checked(result: &str, pretty: bool) {
+    let failed = serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|v| v.get("error").cloned())
+        .is_some();
+    output_result(result, pretty);
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+/// Print a report and exit with the code IT names.
+///
+/// `output_result_checked` maps "there is an `error` field" to exit 1, which is
+/// the right rule for a command whose only two outcomes are worked and did not.
+/// A preservation report has three: clean, something was lost, and a
+/// stop-the-line disagreement that means a defect in the engine or in this
+/// code. Folding the third into the second would make the one outcome nobody
+/// may ship look like an ordinary finding.
+fn output_result_with_exit(result: &str, pretty: bool) {
+    let parsed = serde_json::from_str::<serde_json::Value>(result).ok();
+    let code = match &parsed {
+        Some(v) if v.get("error").is_some() => 1,
+        Some(v) => v.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0) as i32,
+        None => 1,
+    };
+    output_result(result, pretty);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+/// The commands whose output is a verdict, not just a result.
+#[derive(Clone, Copy)]
+enum Gate {
+    Shacl,
+    Enforce,
+    Unpack,
+    Monitor,
+}
+
+/// Map a gate command's own verdict to an exit code: 0 pass, 1 fail, 2 not
+/// determined.
+///
+/// `output_result_checked` sees only an `error` field, and the failures that
+/// matter here are not errors. `conforms: false` and `certificate_refused` are
+/// verdicts, so `shacl shapes.ttl || exit 1` and `unpack x.oopack || exit 1`
+/// passed on exactly the inputs they exist to catch (#323). An undetermined
+/// verdict (`conforms: null`, no checker to re-run the proof) is not a pass
+/// and not a failure, so it gets its own code rather than being folded into
+/// either.
+fn gate_exit_code(gate: Gate, result: &str) -> i32 {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(result) else {
+        return 1;
+    };
+    if v.get("error").is_some() {
+        return 1;
+    }
+    match gate {
+        Gate::Shacl => match v.get("conforms") {
+            Some(serde_json::Value::Bool(true)) => 0,
+            Some(serde_json::Value::Bool(false)) => 1,
+            _ => 2,
+        },
+        Gate::Enforce => {
+            let errors = v
+                .get("violations")
+                .and_then(|x| x.as_array())
+                .is_some_and(|vs| vs.iter().any(|x| x["severity"] == "error"));
+            i32::from(errors)
+        }
+        Gate::Unpack => {
+            let verdict = v.pointer("/certificate/verdict").and_then(|x| x.as_str());
+            match verdict {
+                Some(
+                    "certificate_refused"
+                    | "certificate_unreadable"
+                    | "certificate_not_about_this_pack",
+                ) => 1,
+                Some("checker_absent_nothing_was_checked") => 2,
+                _ if v.get("ok") == Some(&serde_json::Value::Bool(false)) => 1,
+                _ => 0,
+            }
+        }
+        Gate::Monitor => match v.get("status").and_then(|x| x.as_str()) {
+            Some("blocked" | "auto_rolled_back") => 1,
+            _ => 0,
+        },
+    }
+}
+
+fn output_result_gated(result: &str, pretty: bool, gate: Gate) {
+    let code = gate_exit_code(gate, result);
+    output_result(result, pretty);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+fn output_result(result: &str, pretty: bool) {
+    if json_mode() || pretty {
+        if pretty {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result) {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            } else {
+                println!("{}", result);
+            }
+        } else {
+            println!("{}", result);
+        }
+    } else {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(result) {
+            println!("{}", open_ontologies::output::render_human(&v));
+        } else {
+            println!("{}", result);
+        }
+    }
+}
+
+/// Compose the effective cache configuration from `[cache]` in config + CLI overrides.
+fn build_cache_config(
+    cfg: &Config,
+    idle_ttl_secs: Option<u64>,
+    auto_refresh: bool,
+) -> open_ontologies::config::CacheConfig {
+    let mut cc = cfg.cache.clone();
+    if let Some(ttl) = idle_ttl_secs {
+        cc.idle_ttl_secs = ttl;
+    }
+    if auto_refresh {
+        cc.auto_refresh = true;
+    }
+    cc
+}
+
+/// Initialise the tracing subscriber from `[logging]` config. `RUST_LOG`
+/// (when set) takes precedence over `level`. Idempotent: re-invocations are
+/// harmless because `try_init` returns `Err` after the first install.
+fn init_tracing(cfg: &open_ontologies::config::LoggingConfig) {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let level = open_ontologies::config::resolve_logging_level(cfg);
+    let env_filter = EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // Output target: file when configured, else stderr (tracing default).
+    let writer_file = cfg.file.as_deref().and_then(|p| {
+        let path = open_ontologies::config::expand_tilde(p);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()
+    });
+
+    let format = cfg.format.trim().to_lowercase();
+    // Build and install. Use `try_init` so calling this from multiple
+    // subcommand handlers (or repeated test setups) is safe.
+    let result = match (format.as_str(), writer_file) {
+        ("json", Some(f)) => fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .with_writer(std::sync::Mutex::new(f))
+            .try_init(),
+        ("json", None) => fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .with_writer(std::io::stderr)
+            .try_init(),
+        ("pretty", Some(f)) => fmt()
+            .with_env_filter(env_filter)
+            .pretty()
+            .with_writer(std::sync::Mutex::new(f))
+            .try_init(),
+        ("pretty", None) => fmt()
+            .with_env_filter(env_filter)
+            .pretty()
+            .with_writer(std::io::stderr)
+            .try_init(),
+        (_, Some(f)) => fmt()
+            .with_env_filter(env_filter)
+            .compact()
+            .with_writer(std::sync::Mutex::new(f))
+            .try_init(),
+        (_, None) => fmt()
+            .with_env_filter(env_filter)
+            .compact()
+            .with_writer(std::io::stderr)
+            .try_init(),
+    };
+    let _ = result;
+}
+
+/// Compose the effective tool filter from `[tools]` in config + env + CLI flags.
+///
+/// Two independent axes, resolved separately and then combined. The PROFILE
+/// comes from `--tool-profile`, then `OPEN_ONTOLOGIES_TOOL_PROFILE`, then
+/// `[tools] profile`, then `full`. The allow/deny MODE comes from
+/// `--tools-allow` / `--tools-deny` when present and from `[tools]` otherwise,
+/// exactly as before.
+///
+/// An unknown profile name is a startup ERROR. Falling back to `full` on a typo
+/// would publish the whole catalogue to a deployment that asked for one job's
+/// worth of it, silently, which is the one failure worth refusing to boot over.
+fn build_tool_filter(
+    cfg: &Config,
+    cli_allow: Option<&str>,
+    cli_deny: Option<&str>,
+    cli_profile: Option<&str>,
+) -> anyhow::Result<open_ontologies::toolfilter::ToolFilter> {
+    use open_ontologies::toolfilter::{self, Mode, ToolFilter, parse_csv};
+
+    if cli_allow.is_some() && cli_deny.is_some() {
+        anyhow::bail!("--tools-allow and --tools-deny are mutually exclusive");
+    }
+
+    let name = open_ontologies::config::resolve_tool_profile(&cfg.tools, cli_profile);
+    if !toolfilter::is_profile(&name) {
+        anyhow::bail!(
+            "unknown tool profile {:?}; known: {}",
+            name,
+            toolfilter::profiles().join(", ")
+        );
+    }
+    let profile = Some(name);
+
+    if let Some(spec) = cli_allow {
+        let (list, groups) = parse_csv(spec);
+        return Ok(ToolFilter {
+            mode: Mode::Allow,
+            list,
+            groups,
+            profile,
+        });
+    }
+    if let Some(spec) = cli_deny {
+        let (list, groups) = parse_csv(spec);
+        return Ok(ToolFilter {
+            mode: Mode::Deny,
+            list,
+            groups,
+            profile,
+        });
+    }
+    // Fall back to config file.
+    let mode = if cfg.tools.mode.is_empty() {
+        Mode::All
+    } else {
+        Mode::parse(&cfg.tools.mode).map_err(|e| anyhow::anyhow!(e))?
+    };
+    Ok(ToolFilter {
+        mode,
+        list: cfg.tools.list.clone(),
+        groups: cfg.tools.groups.clone(),
+        profile,
+    })
+}
+
+/// Resolves when the process is asked to terminate, naming the signal.
+///
+/// Listens for ctrl-c on every platform and, on unix, for `SIGTERM` as well —
+/// the latter is what `docker stop`, systemd and Kubernetes actually send, so
+/// handling only ctrl-c would leave container shutdown unhandled. The unix arm
+/// is behind `#[cfg(unix)]` so the `x86_64-pc-windows-msvc` target in the
+/// release matrix still builds; there the future simply never resolves.
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("Failed to install ctrl-c handler: {e}");
+            // Never resolve: a broken handler must not look like a shutdown request.
+            std::future::pending::<()>().await
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                eprintln!("Failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => "ctrl-c",
+        _ = terminate => "SIGTERM",
+    }
+}
+
+/// Exit code conventionally reported for a process ended by `sig`.
+fn signal_exit_code(sig: &str) -> i32 {
+    // 128 + signal number: SIGINT = 2, SIGTERM = 15.
+    if sig == "ctrl-c" {
+        130
+    } else {
+        143
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    // The root async future is polled on the calling thread. Windows gives
+    // the main thread 1 MiB of stack (vs 8 MiB on Linux/macOS), which
+    // overflows in debug builds, so run on a thread with an explicit 8 MiB.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(async_main)?
+        .join()
+        .expect("main thread panicked")
+}
+
+#[tokio::main]
+async fn async_main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // Activate JSON mode when --json or --pretty is passed.
+    JSON_MODE.set(cli.json || cli.pretty || !cli.human).ok();
+
+    let proxy_ctx = ProxyCtx {
+        no_connect: cli.no_connect,
+        data_dir: cli.data_dir.clone(),
+        pretty: cli.pretty,
+    };
+
+    // If a daemon is running and this command is proxy-able, route to it.
+    if let Some(batch) = cli.command.to_batch_command() {
+        let payload = serde_json::to_string(&vec![batch])?;
+        if let Some(code) = proxy_if_daemon(&proxy_ctx, &payload, false).await? {
+            std::process::exit(code);
+        }
+    }
+
+    match cli.command {
+        Commands::Init {
+            data_dir,
+            model_url: _model_url,
+            tokenizer_url: _tokenizer_url,
+            model_name: _model_name,
+        } => {
+            let data_dir = expand_tilde(&data_dir);
+            let data_path = std::path::Path::new(&data_dir);
+
+            std::fs::create_dir_all(data_path)?;
+            println!("Created data directory: {data_dir}");
+
+            let db_path = data_path.join("open-ontologies.db");
+            let _db = StateDb::open(&db_path)?;
+            println!("Initialized database: {}", db_path.display());
+
+            let config_path = data_path.join("config.toml");
+            if !config_path.exists() {
+                std::fs::write(&config_path, DEFAULT_CONFIG)?;
+                println!("Created default config: {}", config_path.display());
+            } else {
+                println!("Config already exists: {}", config_path.display());
+            }
+
+            #[cfg(feature = "embeddings")]
+            {
+                let models_dir = data_path.join("models");
+
+                // CLI flags > config.toml > defaults
+                let cfg = open_ontologies::config::Config::load(&config_path)
+                    .map(|c| c.embeddings)
+                    .unwrap_or_default();
+
+                let provider = open_ontologies::config::resolve_embeddings_provider(&cfg);
+                if provider == "openai"
+                    || provider == "openai-compatible"
+                    || provider == "remote"
+                    || provider == "http"
+                {
+                    println!(
+                        "Embeddings provider: {} — skipping local ONNX model download.",
+                        provider
+                    );
+                    println!(
+                        "  Model: {}",
+                        open_ontologies::config::resolve_embeddings_model(&cfg)
+                    );
+                    println!(
+                        "  API base: {}",
+                        open_ontologies::config::resolve_embeddings_api_base(&cfg)
+                    );
+                    if open_ontologies::config::resolve_embeddings_api_key(&cfg).is_none() {
+                        println!(
+                            "  Note: no API key configured (set OPENAI_API_KEY, \
+                             OPEN_ONTOLOGIES_EMBEDDINGS_API_KEY, or [embeddings].api_key \
+                             in config.toml if your gateway requires auth)."
+                        );
+                    }
+                } else {
+                    std::fs::create_dir_all(&models_dir)?;
+
+                    let onnx_url = _model_url
+                        .as_deref()
+                        .or(cfg.model_url.as_deref())
+                        .unwrap_or(open_ontologies::embed::DEFAULT_MODEL_ONNX_URL);
+                    let tok_url = _tokenizer_url
+                        .as_deref()
+                        .or(cfg.tokenizer_url.as_deref())
+                        .unwrap_or(open_ontologies::embed::DEFAULT_MODEL_TOKENIZER_URL);
+                    let onnx_filename = _model_name
+                        .as_deref()
+                        .or(cfg.model_name.as_deref())
+                        .unwrap_or(open_ontologies::embed::DEFAULT_MODEL_FILENAME);
+
+                    let model_path = models_dir.join(onnx_filename);
+                    let tokenizer_path = models_dir.join("tokenizer.json");
+
+                    if !model_path.exists() {
+                        println!("Downloading embedding model from {}...", onnx_url);
+                        open_ontologies::embed::download_model_file(onnx_url, &model_path).await?;
+                        println!("  Model saved: {}", model_path.display());
+                    } else {
+                        println!("Embedding model already exists: {}", model_path.display());
+                    }
+
+                    if !tokenizer_path.exists() {
+                        println!("Downloading tokenizer from {}...", tok_url);
+                        open_ontologies::embed::download_model_file(tok_url, &tokenizer_path)
+                            .await?;
+                        println!("  Tokenizer saved: {}", tokenizer_path.display());
+                    } else {
+                        println!("Tokenizer already exists: {}", tokenizer_path.display());
+                    }
+                }
+            }
+
+            println!("\nOpen Ontologies initialized successfully!");
+        }
+        Commands::Serve {
+            config: config_path,
+            governance_webhook,
+            watch,
+            watch_interval,
+            tools_allow,
+            tools_deny,
+            tool_profile,
+            idle_ttl_secs,
+            auto_refresh,
+            storage_mode,
+        } => {
+            let config_path = expand_tilde(&config_path);
+            let cfg = match Config::load(std::path::Path::new(&config_path)) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("failed to read") {
+                        Config::default()
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+            // Initialise tracing (RUST_LOG > [logging] level > default).
+            init_tracing(&cfg.logging);
+            // Initialise runtime knobs (tableaux limits, fixpoint cap, hash
+            // prefix, feedback thresholds, repo / imports / webhook).
+            open_ontologies::runtime::init_from_config(&cfg);
+
+            // Same precedence as the HTTP arm: an explicit --data-dir wins over
+            // config rather than being ignored.
+            let data_dir = if cli.data_dir != DEFAULT_DATA_DIR {
+                expand_tilde(&cli.data_dir)
+            } else {
+                expand_tilde(&cfg.general.data_dir)
+            };
+            let data_path = std::path::Path::new(&data_dir);
+            let db_path = data_path.join("open-ontologies.db");
+
+            std::fs::create_dir_all(data_path)?;
+            let db = StateDb::open(&db_path)?;
+
+            let mut storage_cfg = cfg.storage.clone();
+            if let Some(m) = storage_mode.as_deref() {
+                storage_cfg.mode = m.to_string();
+            }
+            let graph = build_main_graph(&storage_cfg, data_path)?;
+
+            // Monitor: CLI `--watch` forces enabled; otherwise fall back to
+            // `[monitor] enabled`. CLI `--watch-interval` > env > `[monitor]
+            // interval_secs` > default 30.
+            let monitor_enabled = watch || cfg.monitor.enabled;
+            let monitor_interval = watch_interval.unwrap_or_else(|| {
+                open_ontologies::config::resolve_monitor_interval_secs(&cfg.monitor)
+            });
+
+            let _watch_handle = if monitor_enabled {
+                let watch_db = StateDb::open(&db_path)?;
+                Some(open_ontologies::monitor::start_background_loop(
+                    watch_db,
+                    graph.clone(),
+                    std::time::Duration::from_secs(monitor_interval),
+                ))
+            } else {
+                None
+            };
+
+            let cache_config = build_cache_config(&cfg, idle_ttl_secs, auto_refresh);
+            let tool_filter = build_tool_filter(
+                &cfg,
+                tools_allow.as_deref(),
+                tools_deny.as_deref(),
+                tool_profile.as_deref(),
+            )?;
+            let ontology_dirs =
+                open_ontologies::config::resolve_ontology_dirs(&cfg.general.ontology_dirs);
+            for d in &ontology_dirs {
+                if !d.exists() {
+                    eprintln!(
+                        "warning: ontology_dirs entry does not exist: {}",
+                        d.display()
+                    );
+                }
+            }
+            let server = OpenOntologiesServer::new_with_repo_options(
+                db,
+                graph,
+                governance_webhook,
+                cfg.embeddings,
+                cache_config,
+                tool_filter,
+                ontology_dirs,
+            );
+            let _evictor = open_ontologies::registry::spawn_evictor(server.registry());
+            // A request that arrives before `initialize` is answered with a
+            // JSON-RPC error rather than ending the process. Issue #260: one
+            // `server/discover` probe sent ahead of `initialize` made rmcp
+            // return `ExpectedInitializeRequest` here, and `?` turned that
+            // into an exit the client read as EOF on `initialize`.
+            let service = server
+                .serve(open_ontologies::mcp_handshake::guard(
+                    rmcp::transport::stdio(),
+                ))
+                .await?;
+            service.waiting().await?;
+        }
+        Commands::ServeHttp {
+            config: config_path,
+            host,
+            port,
+            token,
+            governance_webhook,
+            watch,
+            watch_interval,
+            tools_allow,
+            tools_deny,
+            tool_profile,
+            idle_ttl_secs,
+            auto_refresh,
+            storage_mode,
+        } => {
+            use rmcp::transport::streamable_http_server::{
+                StreamableHttpServerConfig, StreamableHttpService,
+                session::local::LocalSessionManager,
+            };
+            use tokio_util::sync::CancellationToken;
+
+            let config_path = expand_tilde(&config_path);
+            let cfg = match Config::load(std::path::Path::new(&config_path)) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("failed to read") {
+                        Config::default()
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+            init_tracing(&cfg.logging);
+            open_ontologies::runtime::init_from_config(&cfg);
+
+            // Resolve effective host / port / token / stateful_mode honouring
+            // CLI > env > config > default precedence.
+            let host =
+                host.unwrap_or_else(|| open_ontologies::config::resolve_http_host(&cfg.http));
+            let port =
+                port.unwrap_or_else(|| open_ontologies::config::resolve_http_port(&cfg.http));
+            // Clap reads `OPEN_ONTOLOGIES_TOKEN` into `token` automatically
+            // (because of `env = "OPEN_ONTOLOGIES_TOKEN"`), so a non-`None`
+            // value already encompasses CLI + env. Fall back to config when
+            // neither is set.
+            let token = token.or_else(|| open_ontologies::config::resolve_http_token(&cfg.http));
+
+            // `--data-dir` used to be dropped here, so `--data-dir /custom daemon
+            // start` wrote daemon.json into /custom while the daemon it started
+            // served ~/.open-ontologies: proxied and local commands then saw
+            // different stores and nothing said so. Invisible whenever both
+            // resolve to the same directory, which is why it survived testing.
+            // Precedence matches host/port/token above: CLI over config.
+            let data_dir = if cli.data_dir != DEFAULT_DATA_DIR {
+                expand_tilde(&cli.data_dir)
+            } else {
+                expand_tilde(&cfg.general.data_dir)
+            };
+            let data_path_owned = std::path::PathBuf::from(&data_dir);
+            let db_path_owned = data_path_owned.join("open-ontologies.db");
+
+            std::fs::create_dir_all(&data_path_owned)?;
+
+            // Shared graph store — all MCP sessions (agent + frontend) see the same triples
+            let mut storage_cfg = cfg.storage.clone();
+            if let Some(m) = storage_mode.as_deref() {
+                storage_cfg.mode = m.to_string();
+            }
+            let shared_graph = build_main_graph(&storage_cfg, &data_path_owned)?;
+
+            // Shared StateDb for lineage REST endpoint
+            let shared_db = StateDb::open(&db_path_owned)?;
+
+            let monitor_enabled = watch || cfg.monitor.enabled;
+            let monitor_interval = watch_interval.unwrap_or_else(|| {
+                open_ontologies::config::resolve_monitor_interval_secs(&cfg.monitor)
+            });
+
+            let _watch_handle = if monitor_enabled {
+                let watch_db = StateDb::open(&db_path_owned)?;
+                Some(open_ontologies::monitor::start_background_loop(
+                    watch_db,
+                    shared_graph.clone(),
+                    std::time::Duration::from_secs(monitor_interval),
+                ))
+            } else {
+                None
+            };
+
+            let ct = CancellationToken::new();
+            // This token is the SOLE shutdown trigger for the HTTP transport: it
+            // is handed to StreamableHttpServerConfig just below and awaited by
+            // `axum::serve(..).with_graceful_shutdown(..)` at the end of this arm.
+            // Nothing else cancels it, so the task spawned here is what makes that
+            // path reachable at all — without it the shutdown future pends forever
+            // and the process is killed outright, with the state DB never flushed.
+            tokio::spawn({
+                let ct = ct.clone();
+                async move {
+                    let sig = shutdown_signal().await;
+                    eprintln!("{sig} received — stopping HTTP server");
+                    ct.cancel();
+                    // Tokio installs its signal handlers process-wide and never
+                    // removes them, so from here the default terminate
+                    // disposition is gone for good. If graceful shutdown then
+                    // stalls — a long synchronous /api/query or /api/load holds
+                    // its connection open, and axum waits for in-flight
+                    // requests — a second signal would be swallowed and only
+                    // SIGKILL would end the process. Stay listening so the
+                    // second one is decisive.
+                    let sig = shutdown_signal().await;
+                    eprintln!("Second {sig} while shutting down — forcing exit");
+                    std::process::exit(signal_exit_code(sig));
+                }
+            });
+            // rmcp >=1.4 marks StreamableHttpServerConfig #[non_exhaustive], so it
+            // can no longer be built with a struct literal from this crate. Start
+            // from Default and set the public fields we care about.
+            #[allow(clippy::field_reassign_with_default)]
+            let http_config = {
+                let mut c = StreamableHttpServerConfig::default();
+                c.stateful_mode = cfg.http.stateful_mode;
+                c.cancellation_token = ct.clone();
+                c
+            };
+
+            let shared_graph_for_service = shared_graph.clone();
+            let gw_for_service = governance_webhook.clone();
+            let embed_config = cfg.embeddings.clone();
+            let cache_config = build_cache_config(&cfg, idle_ttl_secs, auto_refresh);
+            let tool_filter = build_tool_filter(
+                &cfg,
+                tools_allow.as_deref(),
+                tools_deny.as_deref(),
+                tool_profile.as_deref(),
+            )?;
+            let ontology_dirs =
+                open_ontologies::config::resolve_ontology_dirs(&cfg.general.ontology_dirs);
+            for d in &ontology_dirs {
+                if !d.exists() {
+                    eprintln!(
+                        "warning: ontology_dirs entry does not exist: {}",
+                        d.display()
+                    );
+                }
+            }
+            // Spawn a single evictor backed by a registry over the shared graph.
+            // Each per-session server constructs its own registry (active slot
+            // is per-session anyway), but the shared one drives memory cleanup.
+            {
+                let evictor_db = StateDb::open(&db_path_owned)?;
+                let shared_registry = Arc::new(open_ontologies::registry::OntologyRegistry::new(
+                    shared_graph.clone(),
+                    evictor_db,
+                    cache_config.clone(),
+                )?);
+                let _evictor = open_ontologies::registry::spawn_evictor(shared_registry);
+            }
+            let cache_for_service = cache_config.clone();
+            let filter_for_service = tool_filter.clone();
+            let dirs_for_service = ontology_dirs.clone();
+            let service: StreamableHttpService<_, LocalSessionManager> = StreamableHttpService::new(
+                move || {
+                    let db = StateDb::open(&db_path_owned).map_err(std::io::Error::other)?;
+                    Ok(OpenOntologiesServer::new_with_repo_options(
+                        db,
+                        shared_graph_for_service.clone(),
+                        gw_for_service.clone(),
+                        embed_config.clone(),
+                        cache_for_service.clone(),
+                        filter_for_service.clone(),
+                        dirs_for_service.clone(),
+                    ))
+                },
+                Default::default(),
+                http_config,
+            );
+
+            // Simple REST API — no MCP sessions, direct access to shared graph
+            let sg_stats = shared_graph.clone();
+            let sg_query = shared_graph.clone();
+            let sg_update = shared_graph.clone();
+            let sg_load = shared_graph.clone();
+            let sg_save = shared_graph.clone();
+            let sg_load_turtle = shared_graph.clone();
+            let sg_batch = shared_graph.clone();
+            let db_for_batch = shared_db.clone();
+            let api = axum::Router::new()
+                .route("/stats", axum::routing::get(move || {
+                    let g = sg_stats.clone();
+                    async move {
+                        axum::Json(serde_json::from_str::<serde_json::Value>(
+                            &g.get_stats().unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e))
+                        ).unwrap_or_default())
+                    }
+                }))
+                .route("/query", axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let g = sg_query.clone();
+                    async move {
+                        let query = body.0["query"].as_str().unwrap_or("").to_string();
+                        axum::Json(serde_json::from_str::<serde_json::Value>(
+                            &g.sparql_select(&query).unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e))
+                        ).unwrap_or_default())
+                    }
+                }))
+                .route("/update", axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let g = sg_update.clone();
+                    async move {
+                        let query = body.0["query"].as_str().unwrap_or("").to_string();
+                        axum::Json(serde_json::from_str::<serde_json::Value>(
+                            &match g.sparql_update(&query) {
+                                Ok(n)  => format!(r#"{{"ok":true,"affected":{}}}"#, n),
+                                Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+                            }
+                        ).unwrap_or_default())
+                    }
+                }))
+                .route("/load", axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let g = sg_load.clone();
+                    async move {
+                        let path = body.0["path"].as_str().unwrap_or("").to_string();
+                        let path = open_ontologies::config::expand_tilde(&path);
+                        axum::Json(serde_json::from_str::<serde_json::Value>(
+                            &match g.load_file(&path) {
+                                Ok(n)  => format!(r#"{{"ok":true,"triples_loaded":{}}}"#, n),
+                                Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+                            }
+                        ).unwrap_or_default())
+                    }
+                }))
+                .route("/load-turtle", axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let g = sg_load_turtle.clone();
+                    async move {
+                        let turtle = body.0["turtle"].as_str().unwrap_or("").to_string();
+                        let base = body.0["base"].as_str().map(|s| s.to_string());
+                        axum::Json(serde_json::from_str::<serde_json::Value>(
+                            &match g.load_turtle(&turtle, base.as_deref()) {
+                                Ok(n)  => format!(r#"{{"ok":true,"triples_loaded":{}}}"#, n),
+                                Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+                            }
+                        ).unwrap_or_default())
+                    }
+                }))
+                .route("/save", axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let g = sg_save.clone();
+                    async move {
+                        let path = body.0["path"].as_str().unwrap_or("~/.open-ontologies/studio-live.ttl").to_string();
+                        let format = body.0["format"].as_str().unwrap_or("turtle").to_string();
+                        let path = open_ontologies::config::expand_tilde(&path);
+                        axum::Json(serde_json::from_str::<serde_json::Value>(
+                            &match g.save_file(&path, &format) {
+                                Ok(_)  => format!(r#"{{"ok":true,"path":"{}"}}"#, path),
+                                Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+                            }
+                        ).unwrap_or_default())
+                    }
+                }))
+                .route("/batch", axum::routing::post(move |req: axum::extract::Request| {
+                    let g = sg_batch.clone();
+                    let db = db_for_batch.clone();
+                    async move {
+                        let bail = req.uri().query()
+                            .map(|q| q.contains("bail=true"))
+                            .unwrap_or(false);
+                        let body = axum::body::to_bytes(req.into_body(), usize::MAX).await
+                            .unwrap_or_default();
+                        let input = String::from_utf8_lossy(&body).to_string();
+                        // The handle opened at startup, not a fresh
+                        // `StateDb::open` per request: this is the hot path the
+                        // daemon exists to make fast, and it was paying a SQLite
+                        // open on every call while the adjacent /lineage route
+                        // already cloned the shared one.
+                        let runner = open_ontologies::batch::BatchRunner::new(db, g, false);
+                        let (results, _) = runner.run_collect(&input, bail).await;
+                        (axum::http::StatusCode::OK, axum::Json(serde_json::json!(results)))
+                    }
+                }))
+                .route("/lineage", axum::routing::get(move || {
+                    let db = shared_db.clone();
+                    async move {
+                        let conn = db.conn();
+                        let mut stmt = conn.prepare(
+                            "SELECT session_id, seq, timestamp, event_type, operation, details \
+                             FROM lineage_events ORDER BY CAST(timestamp AS INTEGER) ASC, seq ASC LIMIT 500"
+                        ).unwrap();
+                        let rows: Vec<serde_json::Value> = stmt.query_map([], |row| {
+                            let session_id: String = row.get(0)?;
+                            let seq: i64 = row.get(1)?;
+                            let timestamp: String = row.get(2)?;
+                            let event_type: String = row.get(3)?;
+                            let operation: String = row.get(4)?;
+                            let details: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+                            Ok(serde_json::json!({
+                                "session": session_id,
+                                "seq": seq,
+                                "ts": timestamp,
+                                "type": event_type,
+                                "op": operation,
+                                "details": details
+                            }))
+                        }).unwrap().filter_map(|r| r.ok()).collect();
+                        axum::Json(serde_json::json!({ "events": rows }))
+                    }
+                }));
+
+            let router = axum::Router::new()
+                .nest("/api", api)
+                .nest_service("/mcp", service);
+            let router = if let Some(ref token) = token {
+                let expected = format!("Bearer {}", token);
+                router.layer(axum::middleware::from_fn(
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let expected = expected.clone();
+                        async move {
+                            let auth = req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok());
+                            // String equality short-circuits on the first
+                            // differing byte, which leaks the shared prefix
+                            // length through response timing and lets a token
+                            // be recovered byte by byte. Hashing both sides
+                            // first makes the compared values fixed-length and
+                            // unrelated to the token's own bytes, so the
+                            // remaining timing difference reveals nothing, and
+                            // sha2 is already a dependency.
+                            let ok = auth.is_some_and(|got| {
+                                use sha2::{Digest, Sha256};
+                                Sha256::digest(got.as_bytes())
+                                    == Sha256::digest(expected.as_bytes())
+                            });
+                            if ok {
+                                next.run(req).await
+                            } else {
+                                axum::http::Response::builder()
+                                    .status(401)
+                                    .body(axum::body::Body::from("Unauthorized"))
+                                    .unwrap()
+                            }
+                        }
+                    },
+                ))
+            } else {
+                router
+            };
+            // Liveness probe. Registered AFTER the bearer layer on purpose:
+            // `Router::layer` only wraps the routes already present, so adding
+            // /health here leaves it outside the auth middleware while /api and
+            // /mcp stay behind it. Putting it inside the `if let` branch above,
+            // or before the layer call, would make it require credentials in the
+            // one deployment where an unauthenticated probe is the point.
+            //
+            // The body is deliberately limited to status and version: an
+            // unauthenticated endpoint should not describe loaded state, which is
+            // exactly why /api/stats is not the right thing to probe.
+            let router = router.route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }))
+                }),
+            );
+            let router = router.layer(tower_http::cors::CorsLayer::permissive());
+            let addr = format!("{host}:{port}");
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            eprintln!("Open Ontologies MCP server listening on http://{addr}/mcp");
+            if token.is_some() {
+                eprintln!("  Authentication: bearer token required");
+            }
+
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+                .await?;
+        }
+
+        #[cfg(unix)]
+        Commands::ServeUnix {
+            config: config_path,
+            socket,
+            files,
+        } => {
+            let config_path = expand_tilde(&config_path);
+            let cfg = match Config::load(std::path::Path::new(&config_path)) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("failed to read") {
+                        Config::default()
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+            init_tracing(&cfg.logging);
+            open_ontologies::runtime::init_from_config(&cfg);
+
+            // CLI > [socket] path > legacy default
+            let socket_path = socket
+                .or_else(|| cfg.socket.path.clone())
+                .unwrap_or_else(|| "/tmp/tardygrada-ontology-complete.sock".to_string());
+
+            // CLI `--file` (when supplied) overrides `[socket] preload_files`.
+            let preload: Vec<String> = if !files.is_empty() {
+                files
+            } else {
+                cfg.socket.preload_files.clone()
+            };
+
+            let graph = Arc::new(GraphStore::new());
+            for f in &preload {
+                let path = open_ontologies::config::expand_tilde(f);
+                match graph.load_file(&path) {
+                    Ok(n) => eprintln!("Loaded {path}: {n} triples"),
+                    Err(e) => {
+                        eprintln!("Failed to load {path}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            eprintln!("Graph has {} triples total", graph.triple_count());
+
+            use tokio_util::sync::CancellationToken;
+            // Same rationale as the ServeHttp arm: this token is the sole
+            // shutdown trigger. Without the task below, the accept loop in
+            // socket::serve_with_shutdown never exits, the process can only be
+            // killed, and the socket file stays on disk after it is gone.
+            let ct = CancellationToken::new();
+            tokio::spawn({
+                let ct = ct.clone();
+                let socket_path = socket_path.clone();
+                async move {
+                    let sig = shutdown_signal().await;
+                    eprintln!("{sig} received — closing socket");
+                    ct.cancel();
+                    // Same reasoning as the ServeHttp arm: tokio's handlers are
+                    // installed for the process lifetime, so a second signal
+                    // would be swallowed if the accept loop were slow to unwind.
+                    // Unlink on the forced path too, so the escape hatch does
+                    // not reintroduce the leaked socket this commit removes.
+                    let sig = shutdown_signal().await;
+                    eprintln!("Second {sig} while shutting down — forcing exit");
+                    let _ = std::fs::remove_file(&socket_path);
+                    std::process::exit(signal_exit_code(sig));
+                }
+            });
+            open_ontologies::socket::serve_with_shutdown(&socket_path, graph, ct).await?;
+        }
+        #[cfg(windows)]
+        Commands::ServeUnix { .. } => {
+            eprintln!(
+                "serve-unix is not available on Windows. Use `serve` or `serve-http` instead."
+            );
+            std::process::exit(1);
+        }
+
+        // ─── Batch ──────────────────────────────────────────────────
+        Commands::Batch { input, bail } => {
+            let batch_input = if input == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&input)?
+            };
+            // Route to daemon if running.
+            if let Some(code) = proxy_if_daemon(&proxy_ctx, &batch_input, bail).await? {
+                std::process::exit(code);
+            }
+            let (db, graph) = setup(&cli.data_dir)?;
+            let runner = open_ontologies::batch::BatchRunner::new(db, graph, cli.pretty);
+            let exit_code = runner.run(&batch_input, bail).await;
+            std::process::exit(exit_code);
+        }
+
+        // ─── Daemon ─────────────────────────────────────────────────
+        Commands::Daemon { action } => {
+            match action {
+                DaemonAction::Start { host, port, token } => {
+                    // Check if already running.
+                    if let Some(info) = open_ontologies::daemon::read_daemon_info(&cli.data_dir)
+                        && open_ontologies::daemon::is_daemon_alive(info.pid) {
+                            output_json(&serde_json::json!({
+                                "error": format!("daemon already running (pid {})", info.pid),
+                                "url": info.url,
+                            }), cli.pretty);
+                            std::process::exit(1);
+                        }
+                    match open_ontologies::daemon::start_daemon(&cli.data_dir, &host, port, token) {
+                        Ok(info) => output_json(&serde_json::json!({
+                            "ok": true,
+                            "pid": info.pid,
+                            "url": info.url,
+                        }), cli.pretty),
+                        Err(e) => {
+                            output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                DaemonAction::Stop => {
+                    match open_ontologies::daemon::stop_daemon(&cli.data_dir) {
+                        Ok(()) => output_json(&serde_json::json!({"ok": true, "message": "daemon stopped"}), cli.pretty),
+                        Err(e) => {
+                            output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                DaemonAction::Status => {
+                    match open_ontologies::daemon::read_daemon_info(&cli.data_dir) {
+                        None => output_json(&serde_json::json!({"alive": false, "message": "no daemon.json found"}), cli.pretty),
+                        Some(info) => {
+                            let alive = open_ontologies::daemon::is_daemon_alive(info.pid);
+                            output_json(&serde_json::json!({
+                                "alive": alive,
+                                "pid": info.pid,
+                                "url": info.url,
+                            }), cli.pretty);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ─── Core ontology ─────────────────────────────────────────
+        Commands::Validate { input } => {
+            let result = if input == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                GraphStore::validate_text(&buf)
+            } else {
+                GraphStore::validate_file(&input)
+            };
+            match result {
+                Ok(counts) => output_json(
+                    &serde_json::json!({
+                        "ok": true,
+                        "triples": counts.triples,
+                        "statements": counts.statements,
+                    }),
+                    cli.pretty,
+                ),
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Load { path } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            match graph.load_file(&path) {
+                Ok(count) => {
+                    let mut report =
+                        serde_json::json!({"ok": true, "triples_loaded": count, "path": path});
+                    // In-memory is the default backend, so a one-shot `load`
+                    // fills a store that dies with the process. Saying only
+                    // "triples_loaded" here reads as durable, and the next
+                    // command reporting zero reads as data loss.
+                    if is_memory_storage(&cli.data_dir) {
+                        report["warning"] = serde_json::Value::String(
+                            "storage mode is 'memory', so this load did not persist: \
+                             a following command starts from an empty store. Set \
+                             [storage] mode = \"persistent\" or OPEN_ONTOLOGIES_STORAGE_MODE=persistent \
+                             to chain CLI commands."
+                                .to_string(),
+                        );
+                    }
+                    output_json(&report, cli.pretty)
+                }
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Save { path, format } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            match graph.save_file(&path, &format) {
+                Ok(_) => output_json(
+                    &serde_json::json!({"ok": true, "path": path, "format": format}),
+                    cli.pretty,
+                ),
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Clear => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            match graph.clear() {
+                Ok(_) => output_json(
+                    &serde_json::json!({"ok": true, "message": "Store cleared"}),
+                    cli.pretty,
+                ),
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Stats => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let stats_json = graph
+                .get_stats()
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&stats_json, cli.pretty);
+        }
+        Commands::Query { query } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let query_str = if query == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                query
+            };
+            let result = graph
+                .sparql_select(&query_str)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&result, cli.pretty);
+        }
+        Commands::Diff { old_path, new_path } => {
+            use open_ontologies::ontology::OntologyService;
+            let old = std::fs::read_to_string(&old_path)?;
+            let new = std::fs::read_to_string(&new_path)?;
+            let result = OntologyService::diff(&old, &new)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result_checked(&result, cli.pretty);
+        }
+        Commands::Defects { input } => {
+            use open_ontologies::defects::Defects;
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let raw = if input == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                match std::fs::read_to_string(&input) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // JSON on every path, including this one. `lint` used to
+                        // answer a missing file with a bare `Error: No such file`,
+                        // so `open-ontologies lint f | jq` crashed on the case it
+                        // most needs to handle (flaw hunt D4).
+                        output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                        std::process::exit(1);
+                    }
+                }
+            };
+            // Sniff the serialisation rather than assume Turtle, and fail the
+            // process when the document cannot be read. A clean bill of health
+            // over a file that was never parsed is the one answer a checker must
+            // never give (flaw hunt D1).
+            let content = match GraphStore::content_as_turtle(&input, raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = graph.load_turtle(&content, None) {
+                output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                std::process::exit(1);
+            }
+            let result = Defects::check(&graph)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result_checked(&result, cli.pretty);
+        }
+        Commands::Lint { input } => {
+            use open_ontologies::ontology::OntologyService;
+            let (db, _graph) = setup(&cli.data_dir)?;
+            let raw = if input == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&input)?
+            };
+            // lint reasons over Turtle. Sniff the serialisation first, exactly as
+            // validate does, so an RDF/XML document is converted rather than
+            // handed to a Turtle parser that can only fail on it.
+            // A parse failure must not become a Turtle comment. It used to:
+            // the fallback string is a valid Turtle document containing zero
+            // triples, so lint parsed it happily, found nothing to complain
+            // about, and reported `issue_count: 0` with exit 0 over a file it
+            // had never read. A clean bill of health for an unreadable document
+            // is the one answer this command must never give.
+            let content = match GraphStore::content_as_turtle(&input, raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            };
+            let result = OntologyService::lint_with_feedback(&content, Some(&db))
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result_checked(&result, cli.pretty);
+        }
+        Commands::Convert { path, to, output } if open_ontologies::ofn_writer::is_ofn_format(&to) => {
+            match open_ontologies::ofn_writer::convert_file(&path) {
+                Ok(out) => {
+                    let mut report = out.report_json();
+                    if let Some(out_path) = output {
+                        std::fs::write(&out_path, &out.text)?;
+                        report["ok"] = serde_json::json!(true);
+                        report["path"] = serde_json::json!(out_path);
+                        output_json(&report, cli.pretty);
+                    } else {
+                        // The document is stdout, so the report goes to stderr,
+                        // and only when it has something to say: a pipe into
+                        // a file stays a valid OFN document, and what it lacks
+                        // is still printed.
+                        print!("{}", out.text);
+                        if !out.not_exported.is_empty() || !out.not_round_trippable.is_empty() {
+                            eprintln!("{report}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Convert { path, to, output } => {
+            let store = GraphStore::new();
+            match store.load_file(&path) {
+                Ok(_) => match store.serialize(&to) {
+                    Ok(content) => {
+                        if let Some(out_path) = output {
+                            std::fs::write(&out_path, &content)?;
+                            output_json(
+                                &serde_json::json!({"ok": true, "path": out_path, "format": to}),
+                                cli.pretty,
+                            );
+                        } else {
+                            println!("{}", content);
+                        }
+                    }
+                    Err(e) => {
+                        output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Status => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            output_json(
+                &serde_json::json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "triples_loaded": graph.triple_count(),
+                }),
+                cli.pretty,
+            );
+        }
+
+        // ─── Remote ─────────────────────────────────────────────────
+        Commands::Marketplace { action, id, domain } => {
+            use open_ontologies::marketplace;
+            match action.as_str() {
+                "list" => {
+                    let (items, community_error) =
+                        marketplace::cli_list(domain.as_deref()).await;
+                    output_json(
+                        &serde_json::json!({
+                            "count": items.len(),
+                            "ontologies": items,
+                            "community_registry_error": community_error,
+                        }),
+                        cli.pretty,
+                    );
+                }
+                "install" => {
+                    let id = id.as_deref().unwrap_or_else(|| {
+                        eprintln!("Error: --id is required for install");
+                        std::process::exit(1);
+                    });
+                    // Curated first; community packs can never shadow a curated ID.
+                    let pack = match marketplace::cli_resolve(id).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    let (entry_id, entry_name, entry_url, entry_format) =
+                        (pack.id, pack.name, pack.url, pack.format);
+                    let (_db, graph) = setup(&cli.data_dir)?;
+                    let content = GraphStore::fetch_url(&entry_url).await?;
+                    match graph.load_content_with_base(&content, entry_format, Some(&entry_url)) {
+                        Ok(count) => {
+                            let stats = graph.get_stats().unwrap_or_default();
+                            let stats_v = serde_json::from_str::<serde_json::Value>(&stats)
+                                .unwrap_or_default();
+                            let classes = stats_v.get("classes")
+                                .and_then(serde_json::Value::as_u64).unwrap_or(0);
+                            let properties = stats_v.get("properties")
+                                .and_then(serde_json::Value::as_u64).unwrap_or(0);
+                            // A document can parse cleanly and still define nothing.
+                            // Four catalogue URLs pointed at an ontology's METADATA
+                            // header instead of its vocabulary: each returned HTTP 200,
+                            // parsed without error, and reported a successful install
+                            // of forty-odd triples containing no term at all. Anything
+                            // that then aligned or reasoned against the pack silently
+                            // matched nothing. A pack that declares no class and no
+                            // property is not installed, it is empty, and saying so is
+                            // the only way the next broken URL gets noticed.
+                            if !marketplace::declares_terms(classes, properties) {
+                                output_json(
+                                    &serde_json::json!({
+                                        "ok": false,
+                                        "error": format!(
+                                            "'{}' parsed {} triples from {} but declares no classes \
+                                             and no properties, so there is nothing to install. The \
+                                             URL probably points at the ontology's metadata header \
+                                             rather than its vocabulary.",
+                                            entry_id, count, entry_url),
+                                        "installed": false,
+                                        "triples_loaded": count,
+                                        "url": entry_url,
+                                    }),
+                                    cli.pretty,
+                                );
+                                std::process::exit(1);
+                            }
+                            output_json(
+                                &serde_json::json!({
+                                    "ok": true,
+                                    "installed": entry_id,
+                                    "name": entry_name,
+                                    "triples_loaded": count,
+                                    "stats": stats_v,
+                                }),
+                                cli.pretty,
+                            );
+                        }
+                        Err(e) => {
+                            output_json(
+                                &serde_json::json!({"error": format!("Parse error: {}", e)}),
+                                cli.pretty,
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown action: '{}'. Use 'list' or 'install'.", action);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Pull { url, sparql, query } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let content = if sparql {
+                let q = query
+                    .as_deref()
+                    .unwrap_or("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+                GraphStore::fetch_sparql(&url, q).await?
+            } else {
+                GraphStore::fetch_url(&url).await?
+            };
+            match graph.load_turtle(&content, None) {
+                Ok(count) => output_json(
+                    &serde_json::json!({"ok": true, "triples_loaded": count, "source": url}),
+                    cli.pretty,
+                ),
+                Err(e) => {
+                    output_json(
+                        &serde_json::json!({"error": format!("Parse error: {}", e)}),
+                        cli.pretty,
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Push {
+            endpoint,
+            graph: graph_name,
+        } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let content = graph.serialize("ntriples")?;
+            match GraphStore::push_sparql(&endpoint, &content).await {
+                Ok(msg) => {
+                    output_json(&serde_json::json!({"ok": true, "message": msg}), cli.pretty)
+                }
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            }
+            let _ = graph_name; // reserved for future named graph support
+        }
+        Commands::ImportOwl { max_depth } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let mut imported = Vec::new();
+            let mut to_import: Vec<String> = Vec::new();
+
+            let query =
+                "SELECT ?import WHERE { ?onto <http://www.w3.org/2002/07/owl#imports> ?import }";
+            if let Ok(result) = graph.sparql_select(query)
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result)
+                && let Some(results) = parsed["results"].as_array()
+            {
+                for row in results {
+                    if let Some(uri) = row["import"].as_str() {
+                        let uri = uri.trim_matches(|c| c == '<' || c == '>');
+                        to_import.push(uri.to_string());
+                    }
+                }
+            }
+
+            let mut depth = 0;
+            while !to_import.is_empty() && depth < max_depth {
+                let batch = std::mem::take(&mut to_import);
+                for url in batch {
+                    if imported.contains(&url) {
+                        continue;
+                    }
+                    match GraphStore::fetch_url(&url).await {
+                        Ok(content) => {
+                            if let Ok(count) = graph.load_turtle(&content, None) {
+                                eprintln!("Imported {} ({} triples)", url, count);
+                                imported.push(url);
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to import {}: {}", url, e),
+                    }
+                }
+                depth += 1;
+            }
+
+            output_json(
+                &serde_json::json!({"ok": true, "imported": imported.len(), "urls": imported}),
+                cli.pretty,
+            );
+        }
+
+        // ─── Versioning ────────────────────────────────────────────
+        Commands::Version { label } => {
+            use open_ontologies::ontology::OntologyService;
+            let (db, graph) = setup(&cli.data_dir)?;
+            let result = OntologyService::save_version(&db, &graph, &label)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&result, cli.pretty);
+        }
+        Commands::History => {
+            use open_ontologies::ontology::OntologyService;
+            let (db, _graph) = setup(&cli.data_dir)?;
+            let result = OntologyService::list_versions(&db)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&result, cli.pretty);
+        }
+        Commands::Rollback { label } => {
+            use open_ontologies::ontology::OntologyService;
+            let (db, graph) = setup(&cli.data_dir)?;
+            let result = OntologyService::rollback_version(&db, &graph, &label)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&result, cli.pretty);
+        }
+
+        // ─── Data pipeline ──────────────────────────────────────────
+        Commands::Map {
+            data_path,
+            format: _format,
+            save,
+        } => {
+            use open_ontologies::ingest::DataIngester;
+            use open_ontologies::mapping::MappingConfig;
+            let (_db, graph) = setup(&cli.data_dir)?;
+
+            let rows = DataIngester::parse_file(&data_path)?;
+            let headers = DataIngester::extract_headers(&rows);
+
+            let classes_query = r#"SELECT DISTINCT ?c WHERE { { ?c a <http://www.w3.org/2002/07/owl#Class> } UNION { ?c a <http://www.w3.org/2000/01/rdf-schema#Class> } }"#;
+            let props_query = r#"SELECT DISTINCT ?p WHERE { { ?p a <http://www.w3.org/2002/07/owl#ObjectProperty> } UNION { ?p a <http://www.w3.org/2002/07/owl#DatatypeProperty> } UNION { ?p a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> } }"#;
+
+            let classes = graph.sparql_select(classes_query).unwrap_or_default();
+            let props = graph.sparql_select(props_query).unwrap_or_default();
+
+            let mapping = MappingConfig::from_headers(
+                &headers,
+                "http://example.org/data/",
+                "http://example.org/data/Thing",
+            );
+            let mapping_json = serde_json::to_string_pretty(&mapping).unwrap_or_default();
+
+            if let Some(save_path) = save {
+                std::fs::write(&save_path, &mapping_json)?;
+                output_json(
+                    &serde_json::json!({"ok": true, "saved": save_path}),
+                    cli.pretty,
+                );
+            } else {
+                let extract_iris = |json: &str, var: &str| -> Vec<String> {
+                    serde_json::from_str::<serde_json::Value>(json)
+                        .ok()
+                        .and_then(|v| v["results"].as_array().cloned())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|r| {
+                            r[var]
+                                .as_str()
+                                .map(|s| s.trim_matches(|c| c == '<' || c == '>').to_string())
+                        })
+                        .collect()
+                };
+                output_json(
+                    &serde_json::json!({
+                        "data_fields": headers,
+                        "ontology_classes": extract_iris(&classes, "c"),
+                        "ontology_properties": extract_iris(&props, "p"),
+                        "suggested_mapping": serde_json::from_str::<serde_json::Value>(&mapping_json).unwrap_or_default(),
+                    }),
+                    cli.pretty,
+                );
+            }
+        }
+        Commands::Ingest {
+            path,
+            format,
+            mapping,
+            base_iri,
+        } => {
+            use open_ontologies::ingest::DataIngester;
+            use open_ontologies::mapping::MappingConfig;
+            let (_db, graph) = setup(&cli.data_dir)?;
+
+            let base = base_iri.as_deref().unwrap_or("http://example.org/data/");
+            let rows = DataIngester::parse_file_with_format(&path, format.as_deref())?;
+
+            if rows.is_empty() {
+                output_json(
+                    &serde_json::json!({"ok": true, "triples_loaded": 0, "warnings": ["No data rows found"]}),
+                    cli.pretty,
+                );
+            } else {
+                let mapping_config = if let Some(ref mapping_path) = mapping {
+                    let content = std::fs::read_to_string(mapping_path)?;
+                    serde_json::from_str::<MappingConfig>(&content)?
+                } else {
+                    let headers = DataIngester::extract_headers(&rows);
+                    MappingConfig::from_headers(&headers, base, &format!("{}Thing", base))
+                };
+
+                let ntriples = mapping_config.rows_to_ntriples(&rows);
+                match graph.load_ntriples(&ntriples) {
+                    Ok(count) => output_json(
+                        &serde_json::json!({"ok": true, "triples_loaded": count, "rows": rows.len()}),
+                        cli.pretty,
+                    ),
+                    Err(e) => {
+                        output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Commands::Shacl {
+            shapes,
+            valid_at,
+            as_of,
+            all_versions,
+            verified,
+            report_format,
+        } => {
+            use open_ontologies::shacl::ShaclValidator;
+            use open_ontologies::shacl_report::ReportFormat;
+            let format = match ReportFormat::parse(Some(&report_format)) {
+                Ok(f) => f,
+                Err(e) => {
+                    output_result_gated(&serde_json::json!({"error": e}).to_string(), cli.pretty, Gate::Shacl);
+                    return Ok(());
+                }
+            };
+            // Refused before the store is opened: nothing here needs it.
+            if verified && format != ReportFormat::Json {
+                output_result_gated(
+                    &serde_json::json!({"error":
+                        "--verified cannot be combined with --report-format other than json. \
+                         The verified evaluator returns its own report structure, which the \
+                         sh:ValidationReport writer does not read, so the format would be \
+                         silently dropped."})
+                    .to_string(),
+                    cli.pretty,
+                    Gate::Shacl,
+                );
+                return Ok(());
+            }
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let shapes_content = std::fs::read_to_string(&shapes)?;
+            if verified {
+                // Refused rather than ignored: the verified evaluator reads one
+                // N-Triples dump of the store and has no temporal scope, so a
+                // scope could only be dropped, and dropping it would answer a
+                // different question from the one that was asked.
+                let result = if valid_at.is_some() || as_of.is_some() || all_versions {
+                    serde_json::json!({"error":
+                        "--verified cannot be combined with --valid-at, --as-of or \
+                         --all-versions. The verified evaluator reads the whole store and \
+                         has no temporal scope, so the scope would be silently dropped. Run \
+                         the scoped question without --verified, or the verified question \
+                         without a scope."})
+                } else {
+                    open_ontologies::shacl_verified::validate_verified(&graph, &shapes_content)
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                };
+                output_result_gated(&result.to_string(), cli.pretty, Gate::Shacl);
+                return Ok(());
+            }
+            let report = open_ontologies::temporal::ScopeRequest::from_args(
+                valid_at.as_deref(),
+                as_of.as_deref(),
+                all_versions,
+            )
+            .and_then(|request| ShaclValidator::report_scoped(&graph, &shapes_content, &request));
+            let report = match report {
+                Ok(r) => r,
+                Err(e) => {
+                    output_result_gated(
+                        &serde_json::json!({"error": e.to_string()}).to_string(),
+                        cli.pretty,
+                        Gate::Shacl,
+                    );
+                    return Ok(());
+                }
+            };
+            if format == ReportFormat::Json {
+                output_result_gated(&report.to_json_string(), cli.pretty, Gate::Shacl);
+                return Ok(());
+            }
+            // The code comes from the JSON verdict through the same mapping
+            // every format uses (#329), not from the Turtle: a graph has no
+            // `conforms` key, and `sh:conforms false` is written for both a
+            // failing run and an undetermined one, which exit 1 and 2.
+            let code = gate_exit_code(Gate::Shacl, &report.to_json_string());
+            match report.render(format) {
+                Ok(rdf) => {
+                    print!("{rdf}");
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                }
+                Err(e) => output_result_gated(
+                    &serde_json::json!({"error": e.to_string()}).to_string(),
+                    cli.pretty,
+                    Gate::Shacl,
+                ),
+            }
+        }
+        Commands::VocabCheck { data } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let data_content = std::fs::read_to_string(&data)?;
+            let result = open_ontologies::vocab_check::check_data_vocab(&graph, &data_content, &[])
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result_checked(&result, cli.pretty);
+        }
+        Commands::Reason {
+            profile,
+            certificate,
+            rules,
+            valid_at,
+            as_of,
+            all_versions,
+        } => {
+            use open_ontologies::reason::{InferenceTarget, Reasoner};
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let request = match open_ontologies::temporal::ScopeRequest::from_args(
+                valid_at.as_deref(),
+                as_of.as_deref(),
+                all_versions,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    output_result_checked(
+                        &serde_json::json!({"error": e.to_string()}).to_string(),
+                        cli.pretty,
+                    );
+                    return Ok(());
+                }
+            };
+            // Nothing may be written into a versioned store, so passing any
+            // temporal scope argument here makes the run a DRY one rather than
+            // a refusal on every scoped invocation. The report says `dry_run`.
+            // A run with no such argument keeps the CLI's historical `true`,
+            // and on a versioned store it is refused before it can write.
+            let materialize = matches!(request, open_ontologies::temporal::ScopeRequest::Unscoped);
+            let result = match (rules.as_deref(), certificate.as_deref()) {
+                // A supplied table and somewhere to put the certificate.
+                (Some(rules_path), Some(dir)) => Reasoner::run_horn_scoped(
+                    &graph,
+                    std::path::Path::new(rules_path),
+                    std::path::Path::new(dir),
+                    &request,
+                )
+                .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}).to_string()),
+                // A supplied table and nowhere to put the certificate. The run
+                // would report counts nothing can check, over rules nobody has
+                // checked. Refuse rather than let the engine become a second
+                // place that pronounces.
+                (Some(_), None) => serde_json::json!({
+                    "error": "reason --rules needs --certificate DIR. A run over a supplied rule \
+                              table states no verdict of its own: the certificate is the output, \
+                              and `lake exe oo-horn check` is what pronounces on it"
+                })
+                .to_string(),
+                (None, cert) => Reasoner::run_scoped(
+                    &graph,
+                    &profile,
+                    materialize,
+                    InferenceTarget::DefaultGraph,
+                    cert.map(std::path::Path::new),
+                    &request,
+                )
+                .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}).to_string()),
+            };
+            output_result_checked(&result, cli.pretty);
+        }
+        Commands::FolModel {
+            out,
+            solver,
+            max_domain,
+            timeout_secs,
+            unbounded_probe,
+            goals,
+            goals_skip_columns,
+            checker,
+        } => {
+            use open_ontologies::fol_solve::{SolveOptions, Solver, solve_export};
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let result = match Solver::parse(&solver) {
+                Ok(s) => {
+                    let opts = SolveOptions {
+                        solver: s,
+                        max_domain,
+                        timeout_secs,
+                        unbounded_probe,
+                        checker: checker.as_deref().map(std::path::PathBuf::from),
+                    };
+                    solve_export(
+                        &graph,
+                        std::path::Path::new(&out),
+                        &opts,
+                        goals.as_deref().map(std::path::Path::new),
+                        goals_skip_columns,
+                    )
+                    .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}).to_string())
+                }
+                Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+            };
+            output_result_checked(&result, cli.pretty);
+            // A stop-the-line disagreement must fail a pipeline, the way
+            // tools/shacl_differential.py exits 1 on a FALSE_CLEAN.
+            let stop = serde_json::from_str::<serde_json::Value>(&result)
+                .ok()
+                .and_then(|v| v.get("stop_the_line").and_then(|n| n.as_u64()))
+                .unwrap_or(0);
+            if stop > 0 {
+                std::process::exit(1);
+            }
+        }
+        Commands::FolProve {
+            out,
+            prover,
+            timeout_secs,
+            goals,
+            goals_skip_columns,
+            problem,
+            proof,
+        } => {
+            use open_ontologies::tstp::{ProveOptions, Prover, check_files, prove_export};
+            // The check-only pair never touches the store: it is two files and
+            // a checker, which is exactly what a differential already holding
+            // both needs.
+            if let (Some(pp), Some(dd)) = (problem.as_deref(), proof.as_deref()) {
+                let result =
+                    check_files(std::path::Path::new(pp), std::path::Path::new(dd))
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}).to_string());
+                output_result_checked(&result, cli.pretty);
+                let stop = serde_json::from_str::<serde_json::Value>(&result)
+                    .ok()
+                    .and_then(|v| v.get("stop_the_line").and_then(|n| n.as_u64()))
+                    .unwrap_or(0);
+                if stop > 0 {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            let Some(out) = out else {
+                eprintln!("fol-prove needs --out DIR, or --problem FILE with --proof FILE");
+                std::process::exit(2);
+            };
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let result = match Prover::parse(&prover) {
+                Ok(p) => {
+                    let opts = ProveOptions { prover: p, timeout_secs };
+                    prove_export(
+                        &graph,
+                        std::path::Path::new(&out),
+                        &opts,
+                        goals.as_deref().map(std::path::Path::new),
+                        goals_skip_columns,
+                    )
+                    .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}).to_string())
+                }
+                Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+            };
+            output_result_checked(&result, cli.pretty);
+            // A rejected derivation means the prover refuted something other
+            // than the problem this engine emitted. That must fail a pipeline.
+            let stop = serde_json::from_str::<serde_json::Value>(&result)
+                .ok()
+                .and_then(|v| v.get("stop_the_line").and_then(|n| n.as_u64()))
+                .unwrap_or(0);
+            if stop > 0 {
+                std::process::exit(1);
+            }
+        }
+        Commands::Fol { out, format, smt_domain, clif_dialect, clif_comments, goals, goals_skip_columns } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let result = match open_ontologies::tptp::Syntax::parse(
+                &format,
+                Some(&clif_dialect),
+                Some(&clif_comments),
+                smt_domain,
+            ) {
+                Ok(syntax) => open_ontologies::tptp::export(
+                    &graph,
+                    std::path::Path::new(&out),
+                    syntax,
+                    goals.as_deref().map(std::path::Path::new),
+                    goals_skip_columns,
+                )
+                .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}).to_string()),
+                Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+            };
+            output_result_checked(&result, cli.pretty);
+        }
+
+        Commands::RulesImport { from, file, out, allow_partial } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let result = open_ontologies::rulesyntax::run_import(
+                &graph,
+                &from,
+                file.as_deref().map(std::path::Path::new),
+                out.as_deref().map(std::path::Path::new),
+                allow_partial,
+            )
+            .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}).to_string());
+            // A refused rule puts `error` in the response, so an import that
+            // lost anything exits non-zero and a script cannot walk past it.
+            output_result_checked(&result, cli.pretty);
+        }
+
+        Commands::Preserve { .. } | Commands::ClosureDiff { .. } | Commands::TraceLabel { .. } => {
+            // All three need a loaded source and are reached through `batch` in
+            // the normal case, exactly as `reason --certificate` is: the store is
+            // in-memory per process. Running them locally still works against
+            // whatever the configured store holds, and says so when it is
+            // empty rather than reporting a perfect run over nothing.
+            let (db, graph) = setup(&cli.data_dir)?;
+            let Some(batch) = cli.command.to_batch_command() else {
+                anyhow::bail!("internal: this command is proxy-able and must serialise");
+            };
+            let name = batch["command"].as_str().unwrap_or_default().to_string();
+            let args: Vec<String> = batch["args"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let runner = open_ontologies::batch::BatchRunner::new(db, graph, false);
+            let payload =
+                serde_json::json!([{ "command": name, "args": args }]).to_string();
+            let (results, _) = runner.run_collect(&payload, false).await;
+            let result = results
+                .first()
+                .map(|r| r["result"].clone())
+                .unwrap_or_else(|| serde_json::json!({"error": "no result"}));
+            output_result_with_exit(&result.to_string(), cli.pretty);
+        }
+        Commands::Extend {
+            data_path,
+            format: _format,
+            mapping,
+            shapes,
+            profile,
+        } => {
+            use open_ontologies::ingest::DataIngester;
+            use open_ontologies::mapping::MappingConfig;
+            use open_ontologies::reason::Reasoner;
+            use open_ontologies::shacl::ShaclValidator;
+            let (_db, graph) = setup(&cli.data_dir)?;
+
+            let base_iri = "http://example.org/data/";
+
+            // 1. Ingest
+            let rows = DataIngester::parse_file(&data_path)?;
+            let mapping_config = if let Some(ref mapping_path) = mapping {
+                let content = std::fs::read_to_string(mapping_path)?;
+                serde_json::from_str::<MappingConfig>(&content)?
+            } else {
+                let headers = DataIngester::extract_headers(&rows);
+                MappingConfig::from_headers(&headers, base_iri, &format!("{}Thing", base_iri))
+            };
+
+            let ntriples = mapping_config.rows_to_ntriples(&rows);
+            let triples_loaded = graph.load_ntriples(&ntriples)?;
+
+            // 2. SHACL (optional)
+            let shacl_result = if let Some(ref shapes_path) = shapes {
+                let shapes_content = std::fs::read_to_string(shapes_path)?;
+                Some(
+                    ShaclValidator::validate(&graph, &shapes_content)
+                        .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e)),
+                )
+            } else {
+                None
+            };
+
+            // 3. Reason (optional)
+            let reason_result = profile.as_ref().map(|prof| {
+                Reasoner::run(&graph, prof, true)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e))
+            });
+
+            output_json(
+                &serde_json::json!({
+                    "ok": true,
+                    "triples_loaded": triples_loaded,
+                    "rows": rows.len(),
+                    "shacl": shacl_result.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "reason": reason_result.and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok()),
+                }),
+                cli.pretty,
+            );
+        }
+
+        // ─── Lifecycle ──────────────────────────────────────────────
+        Commands::Plan { file, no_conservativity } => {
+            let (db, graph) = setup(&cli.data_dir)?;
+            let turtle = std::fs::read_to_string(&file)?;
+            let planner = open_ontologies::plan::Planner::new(db, graph);
+            // On by default, matching `onto_plan`. A plan whose semantic half
+            // is switched off looks identical to one that found nothing, which
+            // is the confusion the whole conservativity block exists to end.
+            let opts = (!no_conservativity).then(|| {
+                open_ontologies::conservativity::ConservativityOptions {
+                    mode: open_ontologies::conservativity::ExtensionMode::Replacement,
+                    profile: "owl-rl".to_string(),
+                    out: std::env::temp_dir()
+                        .join(format!("oo-plan-conservativity-{}", std::process::id())),
+                    scan_rows: 10_000,
+                    max_rows: 1_000_000,
+                }
+            });
+            let result = planner
+                .plan_checked(&turtle, opts)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result_checked(&result, cli.pretty);
+        }
+        Commands::Apply { mode, plan_id } => {
+            let (db, graph) = setup(&cli.data_dir)?;
+            let planner = open_ontologies::plan::Planner::new(db, graph);
+            let result = planner
+                .apply_plan(plan_id.as_deref(), &mode)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&result, cli.pretty);
+        }
+        Commands::Lock { iris, reason } => {
+            let (db, graph) = setup(&cli.data_dir)?;
+            let planner = open_ontologies::plan::Planner::new(db, graph);
+            let reason_str = reason.as_deref().unwrap_or("locked");
+            for iri in &iris {
+                planner.lock_iri(iri, reason_str);
+            }
+            output_json(
+                &serde_json::json!({
+                    "ok": true,
+                    "locked": iris,
+                    "reason": reason_str,
+                }),
+                cli.pretty,
+            );
+        }
+        Commands::Drift { file_a, file_b } => {
+            let (db, _graph) = setup(&cli.data_dir)?;
+            let v1 = std::fs::read_to_string(&file_a)?;
+            let v2 = std::fs::read_to_string(&file_b)?;
+            let detector = open_ontologies::drift::DriftDetector::new(db);
+            let result = detector
+                .detect(&v1, &v2)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result_checked(&result, cli.pretty);
+        }
+        Commands::Enforce { pack } => {
+            let (db, graph) = setup(&cli.data_dir)?;
+            let enforcer = open_ontologies::enforce::Enforcer::new(db.clone(), graph);
+            let result = enforcer
+                .enforce_with_feedback(&pack, Some(&db))
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result_gated(&result, cli.pretty, Gate::Enforce);
+        }
+        Commands::Unpack {
+            path,
+            verify_only,
+            no_check,
+            checker,
+            certificate_out,
+            load_even_if_refused,
+        } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let opts = open_ontologies::pack::UnpackOptions {
+                verify_only,
+                check_certificate: !no_check,
+                checker: checker.map(std::path::PathBuf::from),
+                certificate_out_dir: certificate_out.map(std::path::PathBuf::from),
+                load_even_if_refused,
+            };
+            let result = open_ontologies::pack::Packer::new(graph)
+                .unpack(&path, &opts)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{e}"}}"#));
+            output_result_gated(&result, cli.pretty, Gate::Unpack);
+        }
+        Commands::Monitor => {
+            let (db, graph) = setup(&cli.data_dir)?;
+            let monitor = open_ontologies::monitor::Monitor::new(db, graph);
+            let result = monitor.run_watchers();
+            let json = serde_json::to_string(&result)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result_gated(&json, cli.pretty, Gate::Monitor);
+        }
+        Commands::MonitorClear => {
+            let (db, graph) = setup(&cli.data_dir)?;
+            let monitor = open_ontologies::monitor::Monitor::new(db, graph);
+            monitor.clear_blocked();
+            output_json(
+                &serde_json::json!({"ok": true, "message": "Monitor block cleared"}),
+                cli.pretty,
+            );
+        }
+        Commands::Lineage { session } => {
+            let (db, _graph) = setup(&cli.data_dir)?;
+            let lineage = open_ontologies::lineage::LineageLog::new(db);
+            let session_id = session.unwrap_or_else(|| "current".to_string());
+            let events = lineage.get_compact(&session_id);
+            output_json(
+                &serde_json::json!({
+                    "session_id": session_id,
+                    "events": events.trim(),
+                }),
+                cli.pretty,
+            );
+        }
+
+        // ─── Clinical ──────────────────────────────────────────────
+        Commands::Crosswalk { code, system } => {
+            match open_ontologies::clinical::ClinicalCrosswalks::load("data/crosswalks.parquet") {
+                Ok(cw) => {
+                    let results = cw.lookup(&code, &system);
+                    output_json(
+                        &serde_json::json!({
+                            "code": code,
+                            "system": system,
+                            "mappings": results.iter().map(|r| serde_json::json!({
+                                "target_code": r.target_code,
+                                "target_system": r.target_system,
+                                "relation": r.relation,
+                                "source_label": r.source_label,
+                                "target_label": r.target_label,
+                            })).collect::<Vec<_>>(),
+                        }),
+                        cli.pretty,
+                    );
+                }
+                Err(e) => {
+                    output_json(
+                        &serde_json::json!({"error": format!("Crosswalks not loaded: {}", e)}),
+                        cli.pretty,
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Enrich {
+            class_iri,
+            code,
+            system,
+        } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            match open_ontologies::clinical::ClinicalCrosswalks::load("data/crosswalks.parquet") {
+                Ok(cw) => {
+                    let result = cw.enrich(&graph, &class_iri, &code, &system);
+                    output_result(&result, cli.pretty);
+                }
+                Err(e) => {
+                    output_json(
+                        &serde_json::json!({"error": format!("Crosswalks not loaded: {}", e)}),
+                        cli.pretty,
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::ValidateClinical => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            match open_ontologies::clinical::ClinicalCrosswalks::load("data/crosswalks.parquet") {
+                Ok(cw) => output_result(&cw.validate_clinical(&graph), cli.pretty),
+                Err(e) => {
+                    output_json(
+                        &serde_json::json!({"error": format!("Crosswalks not loaded: {}", e)}),
+                        cli.pretty,
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // ─── Schema import ─────────────────────────────────────────
+        #[allow(unreachable_code, unused_variables)]
+        Commands::ImportSchema {
+            connection,
+            base_iri,
+        } => {
+            let (_db, graph) = setup(&cli.data_dir)?;
+            let driver = match open_ontologies::sqlsource::detect_driver(&connection) {
+                Ok(d) => d,
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            };
+
+            let tables: Vec<open_ontologies::schema::TableInfo> = match driver {
+                open_ontologies::sqlsource::SqlDriver::Postgres => {
+                    #[cfg(feature = "postgres")]
+                    {
+                        open_ontologies::schema::SchemaIntrospector::introspect_postgres(
+                            &connection,
+                        )
+                        .await?
+                    }
+                    #[cfg(not(feature = "postgres"))]
+                    {
+                        output_json(
+                            &serde_json::json!({"error": "import-schema for postgres requires the 'postgres' feature (compile with --features postgres)"}),
+                            cli.pretty,
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                open_ontologies::sqlsource::SqlDriver::DuckDb => {
+                    #[cfg(feature = "duckdb")]
+                    {
+                        let target = open_ontologies::sqlsource::duckdb_target(&connection);
+                        tokio::task::spawn_blocking(move || {
+                            open_ontologies::schema::SchemaIntrospector::introspect_duckdb(&target)
+                        })
+                        .await??
+                    }
+                    #[cfg(not(feature = "duckdb"))]
+                    {
+                        output_json(
+                            &serde_json::json!({"error": "import-schema for duckdb requires the 'duckdb' feature (compile with --features duckdb)"}),
+                            cli.pretty,
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            };
+
+            let turtle =
+                open_ontologies::schema::SchemaIntrospector::generate_turtle(&tables, &base_iri);
+
+            // Validate + load
+            GraphStore::validate_turtle(&turtle)?;
+            let count = graph.load_turtle(&turtle, Some(&base_iri))?;
+
+            output_json(
+                &serde_json::json!({
+                    "ok": true,
+                    "driver": driver.as_str(),
+                    "tables": tables.len(),
+                    "classes": tables.len(),
+                    "triples": count,
+                    "base_iri": base_iri,
+                }),
+                cli.pretty,
+            );
+        }
+        Commands::SqlIngest {
+            connection,
+            sql,
+            mapping,
+            inline_mapping,
+            base_iri,
+        } => {
+            use open_ontologies::ingest::DataIngester;
+            use open_ontologies::mapping::MappingConfig;
+
+            let (_db, graph) = setup(&cli.data_dir)?;
+
+            // Allow stdin via `-`.
+            let sql = if sql == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                sql
+            };
+
+            let driver = match open_ontologies::sqlsource::detect_driver(&connection) {
+                Ok(d) => d,
+                Err(e) => {
+                    output_json(&serde_json::json!({"error": e.to_string()}), cli.pretty);
+                    std::process::exit(1);
+                }
+            };
+
+            let rows = open_ontologies::sqlsource::query_rows(&connection, &sql).await?;
+
+            if rows.is_empty() {
+                output_json(
+                    &serde_json::json!({
+                        "ok": true,
+                        "driver": driver.as_str(),
+                        "triples_loaded": 0,
+                        "rows_processed": 0,
+                        "warnings": ["Query returned no rows"],
+                    }),
+                    cli.pretty,
+                );
+                return Ok(());
+            }
+
+            let mapping_cfg = if let Some(ref m) = mapping {
+                if inline_mapping {
+                    serde_json::from_str::<MappingConfig>(m)?
+                } else {
+                    let content = std::fs::read_to_string(m)?;
+                    serde_json::from_str::<MappingConfig>(&content)?
+                }
+            } else {
+                let headers = DataIngester::extract_headers(&rows);
+                MappingConfig::from_headers(&headers, &base_iri, &format!("{}Thing", base_iri))
+            };
+
+            let ntriples = mapping_cfg.rows_to_ntriples(&rows);
+            let count = graph.load_ntriples(&ntriples)?;
+
+            output_json(
+                &serde_json::json!({
+                    "ok": true,
+                    "driver": driver.as_str(),
+                    "triples_loaded": count,
+                    "rows_processed": rows.len(),
+                    "mapping_fields": mapping_cfg.mappings.len(),
+                }),
+                cli.pretty,
+            );
+        }
+        Commands::Align {
+            source,
+            target,
+            min_confidence,
+            dry_run,
+            scoring,
+            cardinality,
+        } => {
+            use open_ontologies::align::{AlignOptions, Cardinality, Scoring};
+            let (db, graph) = setup(&cli.data_dir)?;
+            let source_ttl = std::fs::read_to_string(&source)?;
+            let target_ttl = match target {
+                Some(ref t) => Some(std::fs::read_to_string(t)?),
+                None => None,
+            };
+            let engine = open_ontologies::align::AlignmentEngine::new(db, graph);
+            // The command line has one threshold, so the borderline bucket is
+            // empty here exactly as it always was: low == high.
+            let result = Scoring::parse(&scoring)
+                .and_then(|scoring| {
+                    let cardinality = Cardinality::parse(&cardinality)?;
+                    let min_confidence =
+                        min_confidence.unwrap_or_else(|| scoring.default_high_threshold());
+                    engine.align_with_options(
+                        &source_ttl,
+                        target_ttl.as_deref(),
+                        &AlignOptions {
+                            high_threshold: min_confidence,
+                            low_threshold: min_confidence,
+                            dry_run,
+                            scoring,
+                            cardinality,
+                            ..AlignOptions::default()
+                        },
+                    )
+                })
+                .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}).to_string());
+            output_result_with_exit(&result, cli.pretty);
+        }
+        Commands::CrosswalkProbe {
+            source,
+            target,
+            mappings,
+        } => {
+            // Runs here rather than through a daemon: it builds its own two
+            // stores and never reads the loaded one.
+            let result = open_ontologies::crosswalk::probe_files(&source, &target, &mappings)
+                .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+            output_result_with_exit(&result.to_string(), cli.pretty);
+        }
+        Commands::AlignFeedback {
+            source,
+            target,
+            accept,
+            reject,
+        } => {
+            let (db, graph) = setup(&cli.data_dir)?;
+            let engine = open_ontologies::align::AlignmentEngine::new(db, graph);
+            let accepted = accept || !reject;
+            let result = engine
+                .record_feedback(&source, &target, "user_feedback", accepted, None)
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&result, cli.pretty);
+        }
+        Commands::LintFeedback {
+            rule_id,
+            entity,
+            accept,
+            dismiss,
+        } => {
+            let (db, _graph) = setup(&cli.data_dir)?;
+            let accepted = accept || !dismiss;
+            let result = open_ontologies::feedback::record_tool_feedback(
+                &db, "lint", &rule_id, &entity, accepted,
+            )
+            .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&result, cli.pretty);
+        }
+        Commands::EnforceFeedback {
+            rule_id,
+            entity,
+            accept,
+            dismiss,
+        } => {
+            let (db, _graph) = setup(&cli.data_dir)?;
+            let accepted = accept || !dismiss;
+            let result = open_ontologies::feedback::record_tool_feedback(
+                &db, "enforce", &rule_id, &entity, accepted,
+            )
+            .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            output_result(&result, cli.pretty);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod proxy_serialization_tests {
+    use super::*;
+
+    fn args_of(cmd: &Commands) -> (String, Vec<String>) {
+        let v = cmd.to_batch_command().expect("command is proxy-able");
+        let name = v["command"].as_str().unwrap().to_string();
+        let args = v["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        (name, args)
+    }
+
+    #[test]
+    fn a_multi_line_query_stays_one_argument() {
+        // The bug this replaced: the query was rendered into a command line and
+        // the daemon re-tokenized it, but `parse_lines` splits on newlines before
+        // it looks at quotes, so a multi-line query — the normal kind — arrived
+        // torn across lines and failed as an unterminated quote, while the same
+        // query run locally succeeded.
+        let query = "SELECT ?s ?o\nWHERE {\n  ?s <http://example.org/p> ?o .\n}";
+        let (name, args) = args_of(&Commands::Query { query: query.to_string() });
+        assert_eq!(name, "query");
+        assert_eq!(args, vec![query.to_string()]);
+    }
+
+    #[test]
+    fn an_argument_carrying_both_quote_styles_survives_verbatim() {
+        // The old double-quote fallback did not escape backslashes, so an
+        // argument holding both quote styles came out mangled.
+        let query = r#"SELECT ?s WHERE { ?s ?p "it's \"quoted\"" }"#;
+        let (_, args) = args_of(&Commands::Query { query: query.to_string() });
+        assert_eq!(args, vec![query.to_string()]);
+    }
+
+    #[test]
+    fn a_relative_path_is_resolved_before_it_leaves_the_caller() {
+        // The daemon inherits whatever directory `daemon start` ran in, so a
+        // relative path forwarded verbatim resolved against the wrong place.
+        let (name, args) = args_of(&Commands::Load { path: "./data/x.ttl".into() });
+        assert_eq!(name, "load");
+        let sent = std::path::Path::new(&args[0]);
+        assert!(sent.is_absolute(), "sent: {}", args[0]);
+        assert!(args[0].ends_with("x.ttl"), "sent: {}", args[0]);
+        assert!(sent.starts_with(std::env::current_dir().unwrap()));
+    }
+
+    #[test]
+    fn an_absolute_path_is_left_alone() {
+        let abs = if cfg!(windows) { r"C:\onto\proposed.ttl" } else { "/onto/proposed.ttl" };
+        let (_, args) = args_of(&Commands::Plan { file: abs.into(), no_conservativity: false });
+        assert_eq!(args, vec![abs.to_string()]);
+    }
+
+    #[test]
+    fn push_serializes_under_the_name_the_batch_runner_answers_to() {
+        // `push` was serialized by the proxy with no arm on the other side, so it
+        // was the one proxy-able command that could not run while a daemon was up.
+        let (name, args) = args_of(&Commands::Push {
+            endpoint: "http://example.org/sparql".into(),
+            graph: Some("g1".into()),
+        });
+        assert_eq!(name, "push");
+        assert_eq!(args, vec!["http://example.org/sparql", "--graph", "g1"]);
+    }
+
+    #[test]
+    fn the_check_only_form_of_fol_prove_is_not_proxied() {
+        // `--problem` with `--proof` reads two files and no store, so there is
+        // nothing for the daemon to hold. Proxying it would add a hop and, if
+        // the paths were relative, resolve them against the daemon's directory
+        // instead of the caller's.
+        let check_only = Commands::FolProve {
+            out: None,
+            prover: "vampire".into(),
+            timeout_secs: 30,
+            goals: None,
+            goals_skip_columns: 0,
+            problem: Some("p.p".into()),
+            proof: Some("d.tstp".into()),
+        };
+        assert!(check_only.to_batch_command().is_none());
+    }
+
+    #[test]
+    fn a_flag_the_batch_handler_cannot_honour_keeps_the_command_local() {
+        // The batch ingester has no `--format`, so proxying would have dropped it
+        // in silence. Running locally honours it.
+        let with_format = Commands::Ingest {
+            path: "x.csv".into(),
+            format: Some("csv".into()),
+            mapping: None,
+            base_iri: None,
+        };
+        assert!(with_format.to_batch_command().is_none());
+
+        let without = Commands::Ingest {
+            path: "x.csv".into(),
+            format: None,
+            mapping: None,
+            base_iri: None,
+        };
+        assert!(without.to_batch_command().is_some());
+    }
+
+    /// One instance of every variant `to_batch_command` will proxy. If a new
+    /// proxy-able command is added and not listed here it simply goes uncovered;
+    /// nothing here passes falsely because of it.
+    fn every_proxy_able_command() -> Vec<Commands> {
+        vec![
+            Commands::Load { path: "x.ttl".into() },
+            Commands::Save { path: "x.ttl".into(), format: "turtle".into() },
+            Commands::Clear,
+            Commands::Stats,
+            Commands::Query { query: "SELECT ?s WHERE { ?s ?p ?o }".into() },
+            Commands::Lint { input: "x.ttl".into() },
+            Commands::Reason { profile: "rdfs".into(), certificate: None, rules: None, valid_at: None, as_of: None, all_versions: false },
+            // The scoped form proxies too: a daemon-backed `reason --valid-at`
+            // that silently dropped the flag would run over every version and
+            // report a snapshot it did not have.
+            Commands::Reason { profile: "rdfs".into(), certificate: None, rules: None, valid_at: Some("2026-01-01".into()), as_of: None, all_versions: false },
+            Commands::Fol { out: "/tmp/fol".into(), format: "tptp".into(), smt_domain: None, clif_dialect: "iso".into(), clif_comments: "standalone".into(), goals: None, goals_skip_columns: 0 },
+            Commands::FolModel { out: "/tmp/folmodel".into(), solver: "z3".into(), max_domain: 16, timeout_secs: 30, unbounded_probe: true, goals: None, goals_skip_columns: 0, checker: None },
+            Commands::FolProve { out: Some("/tmp/folprove".into()), prover: "vampire".into(), timeout_secs: 30, goals: None, goals_skip_columns: 0, problem: None, proof: None },
+            Commands::Shacl { shapes: "s.ttl".into(), valid_at: None, as_of: None, all_versions: false, verified: false, report_format: "json".into() },
+            Commands::Shacl { shapes: "s.ttl".into(), valid_at: None, as_of: None, all_versions: true, verified: false, report_format: "json".into() },
+            // The verified form proxies too, for the reason the scoped `reason`
+            // form above is here: a daemon-backed `shacl --verified` that
+            // silently dropped the flag would run the UNVERIFIED evaluator and
+            // answer with a conformance verdict that no theorem stands behind.
+            Commands::Shacl { shapes: "s.ttl".into(), valid_at: None, as_of: None, all_versions: false, verified: true, report_format: "json".into() },
+            Commands::Status,
+            Commands::Pull { url: "http://example.org".into(), sparql: false, query: None },
+            Commands::Push { endpoint: "http://example.org".into(), graph: None },
+            Commands::Version { label: "v1".into() },
+            Commands::History,
+            Commands::Rollback { label: "v1".into() },
+            Commands::Ingest { path: "x.csv".into(), format: None, mapping: None, base_iri: None },
+            Commands::Plan { file: "p.ttl".into(), no_conservativity: false },
+            Commands::Apply { mode: "safe".into(), plan_id: None },
+            Commands::Enforce { pack: "generic".into() },
+            Commands::Monitor,
+            Commands::MonitorClear,
+            Commands::Drift { file_a: "a.ttl".into(), file_b: "b.ttl".into() },
+            Commands::Lock { iris: vec!["http://example.org/A".into()], reason: None },
+            Commands::Marketplace { action: "list".into(), id: None, domain: None },
+            Commands::Preserve {
+                projection: Some("p.ttl".into()),
+                projection_graph: None,
+                goals: "g.ttl".into(),
+                goals_skip_columns: 0,
+                profile: "owl-rl".into(),
+                rules: None,
+                out: "/tmp/preserve".into(),
+                seed: vec![],
+                checker: None,
+                require_checker: false,
+            },
+            Commands::ClosureDiff {
+                projection: "p.ttl".into(),
+                out: "/tmp/cd".into(),
+                profile: "owl-rl-ext".into(),
+                skolemise_source: true,
+                checker: None,
+                max_rows: 200,
+                seed: vec![],
+            },
+        ]
+    }
+
+    /// The names on the two sides of the proxy are matched by string across an
+    /// HTTP boundary, and nothing but this checks that they agree. `push` was
+    /// serialized here with no arm in the batch runner, so it was the one
+    /// proxy-able command that could not run while a daemon was up: it fell
+    /// through to `unknown batch command` and exited 1.
+    ///
+    /// Every command is invoked with no arguments, which each arm rejects before
+    /// doing anything — the network ones included — so what this asserts is that
+    /// the arm exists, not what it does.
+    #[tokio::test]
+    async fn every_proxy_able_command_has_an_arm_in_the_batch_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let runner = open_ontologies::batch::BatchRunner::new(
+            db,
+            Arc::new(GraphStore::new()),
+            false,
+        );
+
+        for cmd in every_proxy_able_command() {
+            let Some(v) = cmd.to_batch_command() else {
+                panic!("expected a proxy-able command");
+            };
+            let name = v["command"].as_str().unwrap().to_string();
+            let payload = serde_json::to_string(&vec![
+                serde_json::json!({"command": name, "args": []}),
+            ])
+            .unwrap();
+            let (results, _) = runner.run_collect(&payload, false).await;
+            let err = results[0]["result"]["error"].as_str().unwrap_or("");
+            assert!(
+                !err.contains("unknown batch command"),
+                "`{name}` is proxied but the batch runner has no arm for it"
+            );
+        }
+    }
+
+    #[test]
+    fn commands_that_must_run_locally_are_not_proxied() {
+        assert!(Commands::Diff { old_path: "a.ttl".into(), new_path: "b.ttl".into() }
+            .to_batch_command()
+            .is_none());
+    }
+}

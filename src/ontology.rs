@@ -1,0 +1,280 @@
+use std::collections::HashSet;
+use std::io::Cursor;
+
+use oxigraph::io::{RdfFormat, RdfParser};
+use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::store::Store;
+
+use crate::graph::GraphStore;
+use crate::state::StateDb;
+use std::sync::Arc;
+
+pub struct OntologyService;
+
+impl OntologyService {
+    /// Validate RDF syntax. Returns a JSON report (never errors on bad input).
+    pub fn validate_string(content: &str) -> anyhow::Result<String> {
+        match GraphStore::validate_text(content) {
+            Ok(counts) => Ok(serde_json::json!({
+                "valid": true,
+                "triple_count": counts.triples,
+                "statement_count": counts.statements,
+                "errors": []
+            })
+            .to_string()),
+            Err(e) => Ok(serde_json::json!({
+                "valid": false,
+                "triple_count": 0,
+                "errors": [e.to_string()]
+            })
+            .to_string()),
+        }
+    }
+
+    /// Validate an RDF file.
+    pub fn validate_file(path: &str) -> anyhow::Result<String> {
+        match GraphStore::validate_file(path) {
+            Ok(counts) => Ok(serde_json::json!({
+                "valid": true,
+                "path": path,
+                "triple_count": counts.triples,
+                "statement_count": counts.statements,
+                "errors": []
+            })
+            .to_string()),
+            Err(e) => Ok(serde_json::json!({
+                "valid": false,
+                "path": path,
+                "triple_count": 0,
+                "errors": [e.to_string()]
+            })
+            .to_string()),
+        }
+    }
+
+    /// Convert between RDF formats.
+    pub fn convert(content: &str, _from: &str, to: &str) -> anyhow::Result<String> {
+        let store = GraphStore::new();
+        store.load_turtle(content, None)?;
+        store.serialize(to)
+    }
+
+    /// Diff two ontologies. Returns added/removed triples.
+    ///
+    /// `exact` is false when either snapshot exhausted the RDFC-1.0 budget
+    /// (issue #293). The diff then covers only the triples that mention no
+    /// blank node, `approximate_reason` says why, and `omitted_old` /
+    /// `omitted_new` count the blank-node triples that were not compared, so an
+    /// empty diff over a poisoned input is never mistaken for "no changes".
+    pub fn diff(old_content: &str, new_content: &str) -> anyhow::Result<String> {
+        let old_raw = GraphStore::new();
+        let new_raw = GraphStore::new();
+        old_raw.load_turtle(old_content, None)?;
+        new_raw.load_turtle(new_content, None)?;
+
+        // Parse-local blank node IDs are not identity across snapshots.
+        // Preserve anonymous structure using the same RDFC 1.0 helper as drift.
+        // Canonical IDs can shift under edits; this is not a minimal edit script.
+        let (old_store, new_store, approximation) = GraphStore::canonicalize_pair(&old_raw, &new_raw)?;
+        let old_triples: HashSet<String> = old_store
+            .all_triples()?
+            .into_iter()
+            .map(|(s, p, o)| format!("{s} {p} {o}"))
+            .collect();
+        let new_triples: HashSet<String> = new_store
+            .all_triples()?
+            .into_iter()
+            .map(|(s, p, o)| format!("{s} {p} {o}"))
+            .collect();
+
+        let added: Vec<&String> = new_triples.difference(&old_triples).collect();
+        let removed: Vec<&String> = old_triples.difference(&new_triples).collect();
+
+        let mut report = serde_json::json!({
+            "added": added.len(),
+            "removed": removed.len(),
+            "added_triples": added,
+            "removed_triples": removed,
+            "exact": approximation.is_none(),
+        });
+        if let Some(a) = approximation {
+            report["approximate_reason"] =
+                serde_json::json!(format!("blank-node triples were not compared: {}", a.reason));
+            report["omitted_old"] = serde_json::json!(a.omitted_old);
+            report["omitted_new"] = serde_json::json!(a.omitted_new);
+        }
+        Ok(report.to_string())
+    }
+
+    /// Collect raw lint issues from a Store.
+    fn collect_lint_issues(store: &Store) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut issues: Vec<serde_json::Value> = Vec::new();
+
+        // Find classes without rdfs:label
+        let query = r#"
+            SELECT ?class WHERE {
+                { ?class a <http://www.w3.org/2002/07/owl#Class> }
+                UNION
+                { ?class a <http://www.w3.org/2000/01/rdf-schema#Class> }
+                FILTER(isIRI(?class))
+                FILTER NOT EXISTS { ?class <http://www.w3.org/2000/01/rdf-schema#label> ?label }
+            }
+        "#;
+        if let Ok(QueryResults::Solutions(solutions)) = SparqlEvaluator::new()
+            .parse_query(query)
+            .map_err(anyhow::Error::from)
+            .and_then(|p| p.on_store(store).execute().map_err(anyhow::Error::from))
+        {
+            for row in solutions.flatten() {
+                if let Some(term) = row.get("class") {
+                    issues.push(serde_json::json!({
+                        "severity": "warning",
+                        "type": "missing_label",
+                        "entity": term.to_string(),
+                        "message": format!("{} has no rdfs:label", term),
+                    }));
+                }
+            }
+        }
+
+        // Find classes without rdfs:comment
+        let query = r#"
+            SELECT ?class WHERE {
+                { ?class a <http://www.w3.org/2002/07/owl#Class> }
+                UNION
+                { ?class a <http://www.w3.org/2000/01/rdf-schema#Class> }
+                FILTER(isIRI(?class))
+                FILTER NOT EXISTS { ?class <http://www.w3.org/2000/01/rdf-schema#comment> ?comment }
+            }
+        "#;
+        if let Ok(QueryResults::Solutions(solutions)) = SparqlEvaluator::new()
+            .parse_query(query)
+            .map_err(anyhow::Error::from)
+            .and_then(|p| p.on_store(store).execute().map_err(anyhow::Error::from))
+        {
+            for row in solutions.flatten() {
+                if let Some(term) = row.get("class") {
+                    issues.push(serde_json::json!({
+                        "severity": "warning",
+                        "type": "missing_comment",
+                        "entity": term.to_string(),
+                        "message": format!("{} has no rdfs:comment", term),
+                    }));
+                }
+            }
+        }
+
+        // Find properties without domain
+        let query = r#"
+            SELECT ?prop WHERE {
+                { ?prop a <http://www.w3.org/2002/07/owl#ObjectProperty> }
+                UNION
+                { ?prop a <http://www.w3.org/2002/07/owl#DatatypeProperty> }
+                FILTER(isIRI(?prop))
+                FILTER NOT EXISTS { ?prop <http://www.w3.org/2000/01/rdf-schema#domain> ?d }
+            }
+        "#;
+        if let Ok(QueryResults::Solutions(solutions)) = SparqlEvaluator::new()
+            .parse_query(query)
+            .map_err(anyhow::Error::from)
+            .and_then(|p| p.on_store(store).execute().map_err(anyhow::Error::from))
+        {
+            for row in solutions.flatten() {
+                if let Some(term) = row.get("prop") {
+                    issues.push(serde_json::json!({
+                        "severity": "info",
+                        "type": "missing_domain",
+                        "entity": term.to_string(),
+                        "message": format!("{} has no rdfs:domain", term),
+                    }));
+                }
+            }
+        }
+
+        Ok(issues)
+    }
+
+    /// Lint an ontology with feedback-based suppression (see
+    /// `crate::feedback::apply_feedback` for what suppression may touch).
+    pub fn lint_with_feedback(content: &str, db: Option<&crate::state::StateDb>) -> anyhow::Result<String> {
+        let store = Store::new()?;
+        let reader = Cursor::new(content.as_bytes());
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(reader) {
+            store.insert(&quad?)?;
+        }
+
+        let raw_issues = Self::collect_lint_issues(&store)?;
+        let (issues, suppressed) = crate::feedback::apply_feedback(db, "lint", "type", raw_issues);
+
+        // `issue_count` stays over `issues` only; `suppressed` lists what
+        // feedback waived so "clean" and "clean after waivers" read apart.
+        Ok(serde_json::json!({
+            "issues": issues,
+            "issue_count": issues.len(),
+            "suppressed_count": suppressed.len(),
+            "suppressed": suppressed,
+        })
+        .to_string())
+    }
+
+    /// Lint an ontology -- check for missing labels, comments, domains.
+    pub fn lint(content: &str) -> anyhow::Result<String> {
+        Self::lint_with_feedback(content, None)
+    }
+
+    /// Save a named version (snapshot) of the current graph store.
+    pub fn save_version(db: &StateDb, store: &Arc<GraphStore>, label: &str) -> anyhow::Result<String> {
+        let content = store.snapshot("nquads")?;
+        let count = store.triple_count();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO ontology_versions (label, triple_count, content, format) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![label, count as i64, content, "nquads"],
+        )?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "label": label,
+            "triple_count": count,
+        }).to_string())
+    }
+
+    /// List all saved ontology versions.
+    pub fn list_versions(db: &StateDb) -> anyhow::Result<String> {
+        let conn = db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, triple_count, format, created_at FROM ontology_versions ORDER BY id DESC"
+        )?;
+        let versions: Vec<serde_json::Value> = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "label": row.get::<_, String>(1)?,
+                "triple_count": row.get::<_, i64>(2)?,
+                "format": row.get::<_, String>(3)?,
+                "created_at": row.get::<_, String>(4)?,
+            }))
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(serde_json::json!({"versions": versions}).to_string())
+    }
+
+    /// Rollback the graph store to a previously saved version.
+    pub fn rollback_version(db: &StateDb, store: &Arc<GraphStore>, label: &str) -> anyhow::Result<String> {
+        let conn = db.conn();
+        let (content, format): (String, String) = conn.query_row(
+            "SELECT content, format FROM ontology_versions WHERE label = ?1 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![label],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let rdf_format = match format.as_str() {
+            "nquads" => RdfFormat::NQuads,
+            "ntriples" => RdfFormat::NTriples,
+            _ => anyhow::bail!("unsupported saved version format: {format}"),
+        };
+        store.clear()?;
+        let count = store.load_content(&content, rdf_format)?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "label": label,
+            "triples_restored": count,
+        }).to_string())
+    }
+}

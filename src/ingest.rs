@@ -1,0 +1,551 @@
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::fs;
+
+/// Data ingester that parses structured data files into rows of key-value pairs.
+pub struct DataIngester;
+
+/// Convert a serde_json::Value to a flat string representation.
+fn json_value_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+impl DataIngester {
+    /// Detect the file format from the file extension.
+    /// Returns one of: "csv", "json", "ndjson", "xml", "yaml", "xlsx", "parquet".
+    /// Defaults to "csv" if the extension is unrecognised.
+    pub fn detect_format(path: &str) -> &'static str {
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match ext.as_str() {
+            "csv" => "csv",
+            "json" => "json",
+            "jsonl" | "ndjson" => "ndjson",
+            "xml" => "xml",
+            "yaml" | "yml" => "yaml",
+            "xlsx" => "xlsx",
+            "parquet" => "parquet",
+            _ => "csv",
+        }
+    }
+
+    /// Parse CSV content with headers into rows.
+    pub fn parse_csv(content: &str) -> Result<Vec<HashMap<String, String>>> {
+        let mut reader = csv::Reader::from_reader(content.as_bytes());
+        let headers: Vec<String> = reader
+            .headers()
+            .context("Failed to read CSV headers")?
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+
+        let mut rows = Vec::new();
+        for result in reader.records() {
+            let record = result.context("Failed to read CSV record")?;
+            let mut row = HashMap::new();
+            for (i, value) in record.iter().enumerate() {
+                if let Some(key) = headers.get(i) {
+                    row.insert(key.clone(), value.to_string());
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Parse a JSON string. Accepts a JSON array of objects or a single object.
+    pub fn parse_json(content: &str) -> Result<Vec<HashMap<String, String>>> {
+        let value: serde_json::Value =
+            serde_json::from_str(content).context("Failed to parse JSON")?;
+        match value {
+            serde_json::Value::Array(arr) => {
+                let mut rows = Vec::new();
+                for item in &arr {
+                    if let serde_json::Value::Object(map) = item {
+                        let row: HashMap<String, String> = map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), json_value_to_string(v)))
+                            .collect();
+                        rows.push(row);
+                    }
+                }
+                Ok(rows)
+            }
+            serde_json::Value::Object(map) => {
+                let row: HashMap<String, String> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), json_value_to_string(v)))
+                    .collect();
+                Ok(vec![row])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Parse newline-delimited JSON (NDJSON / JSON Lines).
+    pub fn parse_ndjson(content: &str) -> Result<Vec<HashMap<String, String>>> {
+        let mut rows = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(trimmed).context("Failed to parse NDJSON line")?;
+            if let serde_json::Value::Object(map) = value {
+                let row: HashMap<String, String> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), json_value_to_string(v)))
+                    .collect();
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Parse a YAML string containing an array of objects.
+    pub fn parse_yaml(content: &str) -> Result<Vec<HashMap<String, String>>> {
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(content).context("Failed to parse YAML")?;
+        match value {
+            serde_yaml::Value::Sequence(seq) => {
+                let mut rows = Vec::new();
+                for item in &seq {
+                    if let serde_yaml::Value::Mapping(map) = item {
+                        let mut row = HashMap::new();
+                        for (k, v) in map {
+                            let key = match k {
+                                serde_yaml::Value::String(s) => s.clone(),
+                                other => format!("{other:?}"),
+                            };
+                            let val = match v {
+                                serde_yaml::Value::String(s) => s.clone(),
+                                serde_yaml::Value::Number(n) => n.to_string(),
+                                serde_yaml::Value::Bool(b) => b.to_string(),
+                                serde_yaml::Value::Null => String::new(),
+                                other => format!("{other:?}"),
+                            };
+                            row.insert(key, val);
+                        }
+                        rows.push(row);
+                    }
+                }
+                Ok(rows)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Parse XML with a `<root><record>...</record></root>` structure.
+    /// Depth 1 = root element, depth 2 = record boundary, depth 3 = field elements.
+    pub fn parse_xml(content: &str) -> Result<Vec<HashMap<String, String>>> {
+        use quick_xml::events::Event;
+        use quick_xml::reader::Reader;
+
+        let mut reader = Reader::from_str(content);
+        // Trimming every event destroys spaces when a field is split by a
+        // comment or CDATA boundary. Normalize only the completed field.
+        reader.config_mut().trim_text(false);
+
+        let mut rows: Vec<HashMap<String, String>> = Vec::new();
+        let mut current_row: Option<HashMap<String, String>> = None;
+        let mut current_field: Option<String> = None;
+        // Keep raw text until the field closes: XML whitespace is trimmed
+        // before entity decoding, while CDATA is literal and never unescaped.
+        let mut field_parts: Vec<(String, bool)> = Vec::new();
+        let mut depth: u32 = 0;
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) => {
+                    depth += 1;
+                    match depth {
+                        1 => {
+                            // Root element — nothing to do
+                        }
+                        2 => {
+                            // Record start
+                            current_row = Some(HashMap::new());
+                        }
+                        3 => {
+                            // Field element start
+                            let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                            field_parts.clear();
+                            current_field = Some(name);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::Text(e)) => {
+                    if depth == 3 && current_row.is_some() && current_field.is_some() {
+                        let text = std::str::from_utf8(e.as_ref())
+                            .context("Failed to decode XML field text")?;
+                        field_parts.push((text.to_string(), true));
+                    }
+                }
+                Ok(Event::CData(e)) => {
+                    if depth == 3 && current_row.is_some() && current_field.is_some() {
+                        let text = e.decode().context("Failed to decode XML field CDATA")?;
+                        field_parts.push((text.into_owned(), false));
+                    }
+                }
+                Ok(Event::End(_)) => {
+                    match depth {
+                        2 => {
+                            // Record end — push row
+                            if let Some(row) = current_row.take() {
+                                rows.push(row);
+                            }
+                        }
+                        3 => {
+                            // Keep quick-xml's existing XML-whitespace policy,
+                            // including significant entity-encoded spaces.
+                            for (raw, _) in &mut field_parts {
+                                *raw = raw.trim_start_matches([' ', '\t', '\r', '\n']).to_string();
+                                if !raw.is_empty() {
+                                    break;
+                                }
+                            }
+                            for (raw, _) in field_parts.iter_mut().rev() {
+                                *raw = raw.trim_end_matches([' ', '\t', '\r', '\n']).to_string();
+                                if !raw.is_empty() {
+                                    break;
+                                }
+                            }
+                            let mut value = String::new();
+                            for (raw, escaped) in &field_parts {
+                                if *escaped {
+                                    value.push_str(
+                                        &quick_xml::escape::unescape(raw)
+                                            .context("Failed to decode XML field text")?,
+                                    );
+                                } else {
+                                    value.push_str(raw);
+                                }
+                            }
+                            // An empty field did not create or overwrite a key.
+                            if !value.is_empty()
+                                && let (Some(row), Some(field)) = (&mut current_row, &current_field)
+                            {
+                                row.insert(field.clone(), value);
+                            }
+                            field_parts.clear();
+                            current_field = None;
+                        }
+                        _ => {}
+                    }
+                    depth -= 1;
+                }
+                Ok(Event::Eof) => {
+                    // quick-xml accepts EOF with unclosed elements. Do not
+                    // report a completed prefix as a successful ingestion.
+                    if depth != 0 {
+                        anyhow::bail!(
+                            "XML parse error: unexpected EOF with {depth} unclosed elements"
+                        );
+                    }
+                    break;
+                }
+                Err(e) => return Err(anyhow::anyhow!("XML parse error: {e}")),
+                _ => {}
+            }
+        }
+        Ok(rows)
+    }
+    /// Parse an Excel (.xlsx) file. First row is treated as headers.
+    pub fn parse_xlsx_file(path: &str) -> Result<Vec<HashMap<String, String>>> {
+        use calamine::{open_workbook, Reader, Xlsx};
+
+        let mut workbook: Xlsx<_> =
+            open_workbook(path).context("Failed to open XLSX workbook")?;
+
+        let sheet_names = workbook.sheet_names().to_vec();
+        let first_sheet = sheet_names
+            .first()
+            .context("XLSX workbook has no sheets")?
+            .clone();
+
+        let range = workbook
+            .worksheet_range(&first_sheet)
+            .context("Failed to read XLSX worksheet")?;
+
+        let mut row_iter = range.rows();
+        let header_row = row_iter.next().context("XLSX file has no rows")?;
+
+        let headers: Vec<String> = header_row
+            .iter()
+            .map(Self::calamine_cell_to_string)
+            .collect();
+
+        let mut rows = Vec::new();
+        for data_row in row_iter {
+            let mut row = HashMap::new();
+            for (i, cell) in data_row.iter().enumerate() {
+                if let Some(key) = headers.get(i) {
+                    row.insert(key.clone(), Self::calamine_cell_to_string(cell));
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Convert a calamine Data cell to a string.
+    fn calamine_cell_to_string(cell: &calamine::Data) -> String {
+        match cell {
+            calamine::Data::Int(i) => i.to_string(),
+            calamine::Data::Float(f) => f.to_string(),
+            calamine::Data::String(s) => s.clone(),
+            calamine::Data::Bool(b) => b.to_string(),
+            calamine::Data::DateTime(dt) if dt.is_datetime() => dt
+                .as_datetime()
+                .map(|value| value.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+                .unwrap_or_else(|| dt.to_string()),
+            calamine::Data::DateTime(dt) => dt.to_string(),
+            calamine::Data::DateTimeIso(s) => s.clone(),
+            calamine::Data::DurationIso(s) => s.clone(),
+            calamine::Data::Error(e) => format!("{e:?}"),
+            calamine::Data::Empty => String::new(),
+        }
+    }
+
+    /// Parse a Parquet file into rows.
+    pub fn parse_parquet_file(path: &str) -> Result<Vec<HashMap<String, String>>> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let file = File::open(path).context("Failed to open Parquet file")?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .context("Failed to create Parquet reader builder")?;
+
+        let reader = builder.build().context("Failed to build Parquet reader")?;
+
+        let mut rows = Vec::new();
+        for batch_result in reader {
+            let batch: arrow::array::RecordBatch =
+                batch_result.context("Failed to read Parquet record batch")?;
+            let schema = batch.schema();
+            let num_rows = batch.num_rows();
+            let num_cols = batch.num_columns();
+
+            for row_idx in 0..num_rows {
+                let mut row = HashMap::new();
+                for col_idx in 0..num_cols {
+                    let field = schema.field(col_idx);
+                    let col = batch.column(col_idx);
+                    let value = if col.is_null(row_idx) {
+                        String::new()
+                    } else {
+                        Self::arrow_array_value_to_string(col.as_ref(), row_idx, field.data_type())
+                            .with_context(|| {
+                                format!(
+                                    "Failed to format Parquet column {} row {row_idx}",
+                                    field.name()
+                                )
+                            })?
+                    };
+                    row.insert(field.name().clone(), value);
+                }
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Convert an Arrow array value at a given index to a string.
+    fn arrow_array_value_to_string(
+        array: &dyn arrow::array::Array,
+        idx: usize,
+        data_type: &arrow::datatypes::DataType,
+    ) -> Result<String> {
+        use arrow::array::*;
+        use arrow::datatypes::DataType as ArrowType;
+
+        Ok(match data_type {
+            ArrowType::Boolean => {
+                let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::Int8 => {
+                let a = array.as_any().downcast_ref::<Int8Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::Int16 => {
+                let a = array.as_any().downcast_ref::<Int16Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::Int32 => {
+                let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::Int64 => {
+                let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::UInt8 => {
+                let a = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::UInt16 => {
+                let a = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::UInt32 => {
+                let a = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::UInt64 => {
+                let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::Float32 => {
+                let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::Float64 => {
+                let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::Utf8 => {
+                let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+                a.value(idx).to_string()
+            }
+            ArrowType::LargeUtf8 => {
+                let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                a.value(idx).to_string()
+            }
+            // Format this cell, never the whole column's Debug view. Dates,
+            // timestamps and scaled decimals otherwise include every other
+            // row's value in the string assigned to this one.
+            _ => arrow::util::display::array_value_to_string(array, idx)?,
+        })
+    }
+    /// Read a whole text file into memory, refusing anything over the ingest cap.
+    /// Ingest reads the entire file at once, so an unbounded read is an
+    /// out-of-memory lever for any caller that can point the tool at a large file.
+    fn read_to_string_capped(path: &str) -> Result<String> {
+        const MAX_INGEST_BYTES: u64 = 512 * 1024 * 1024;
+        let meta =
+            fs::metadata(path).with_context(|| format!("Failed to stat file: {path}"))?;
+        if meta.len() > MAX_INGEST_BYTES {
+            anyhow::bail!(
+                "file {path} is {} bytes, over the {MAX_INGEST_BYTES}-byte ingest cap",
+                meta.len()
+            );
+        }
+        fs::read_to_string(path).with_context(|| format!("Failed to read file: {path}"))
+    }
+
+    /// Dispatch to the correct parser based on detected format.
+    /// For text formats, reads the file content first.
+    pub fn parse_file(path: &str) -> Result<Vec<HashMap<String, String>>> {
+        Self::parse_file_with_format(path, None)
+    }
+
+    /// Parse the explicitly requested format, or infer it from the extension.
+    pub fn parse_file_with_format(
+        path: &str,
+        format: Option<&str>,
+    ) -> Result<Vec<HashMap<String, String>>> {
+        let format = format.unwrap_or_else(|| Self::detect_format(path));
+        match format {
+            "csv" => {
+                let content = Self::read_to_string_capped(path)?;
+                Self::parse_csv(&content)
+            }
+            "json" => {
+                let content = Self::read_to_string_capped(path)?;
+                Self::parse_json(&content)
+            }
+            "ndjson" => {
+                let content = Self::read_to_string_capped(path)?;
+                Self::parse_ndjson(&content)
+            }
+            "yaml" => {
+                let content = Self::read_to_string_capped(path)?;
+                Self::parse_yaml(&content)
+            }
+            "xml" => {
+                let content = Self::read_to_string_capped(path)?;
+                Self::parse_xml(&content)
+            }
+            "xlsx" => Self::parse_xlsx_file(path),
+            "parquet" => Self::parse_parquet_file(path),
+            _ => anyhow::bail!("Unsupported data format: {format}"),
+        }
+    }
+
+    /// Collect unique keys from all rows, sorted alphabetically.
+    /// Column names in the order the FILE gives them, when the format has an
+    /// order (CSV and XLSX: the header row; Parquet: the schema), else sorted. `extract_headers` sorts,
+    /// which loses which column came first, and the first column is the
+    /// identifier candidate for induction.
+    pub fn headers_in_order(path: &str, rows: &[HashMap<String, String>]) -> Vec<String> {
+        let ordered: Option<Vec<String>> = match Self::detect_format(path) {
+            "csv" => std::fs::read_to_string(path).ok().and_then(|c| {
+                let mut r = csv::ReaderBuilder::new().has_headers(true).from_reader(c.as_bytes());
+                r.headers().ok().map(|h| h.iter().map(|x| x.to_string()).collect())
+            }),
+            "xlsx" => (|| -> Result<Vec<String>> {
+                use calamine::{open_workbook, Reader, Xlsx};
+                let mut workbook: Xlsx<_> = open_workbook(path)?;
+                let first_sheet = workbook
+                    .sheet_names()
+                    .first()
+                    .context("XLSX workbook has no sheets")?
+                    .clone();
+                let range = workbook.worksheet_range(&first_sheet)?;
+                let header = range.rows().next().context("XLSX file has no rows")?;
+                Ok(header.iter().map(Self::calamine_cell_to_string).collect())
+            })()
+            .ok(),
+            "parquet" => (|| -> Result<Vec<String>> {
+                use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+                let builder =
+                    ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+                Ok(builder
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect())
+            })()
+            .ok(),
+            _ => None,
+        };
+        match ordered {
+            Some(h) if !h.is_empty() => {
+                // The file's order for the columns it names, then any key a
+                // row carries that the header did not.
+                let mut out = h;
+                for k in Self::extract_headers(rows) {
+                    if !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+                out
+            }
+            _ => Self::extract_headers(rows),
+        }
+    }
+
+    pub fn extract_headers(rows: &[HashMap<String, String>]) -> Vec<String> {
+        let mut keys: Vec<String> = rows
+            .iter()
+            .flat_map(|row| row.keys().cloned())
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .collect();
+        keys.sort();
+        keys
+    }
+}

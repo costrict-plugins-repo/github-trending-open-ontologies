@@ -1,0 +1,136 @@
+[package]
+name = "open-ontologies"
+version = "2.1.0"
+edition = "2024"
+description = "AI-native ontology engine: an MCP server and CLI for building, validating, querying and reasoning over RDF and OWL, with a native SHIQ tableaux reasoner, SHACL validation and SPARQL. Single binary, no JVM."
+license = "MIT"
+repository = "https://github.com/fabio-rovai/open-ontologies"
+homepage = "https://github.com/fabio-rovai/open-ontologies"
+documentation = "https://docs.rs/open-ontologies"
+readme = "README.md"
+keywords = ["ontology", "owl", "rdf", "sparql", "mcp"]
+categories = ["command-line-utilities", "data-structures", "science"]
+# Without this, `cargo package` walks the whole tree. benchmark/ alone is 23GB
+# against a 10MB crates.io limit, and studio/ and case-studies/ add another
+# 5.5GB. Only what is needed to build and read the crate ships.
+#
+# Patterns are gitignore-style, so a bare `README.md` matches at every depth
+# and pulled in every node_modules readme under studio/. Leading slashes anchor
+# them to the package root.
+include = [
+    "/src/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+]
+
+[[bin]]
+name = "open-ontologies"
+path = "src/main.rs"
+
+[dependencies]
+# `is_daemon_alive` runs on every proxy-able invocation; a bare kill(pid, 0)
+# avoids forking /bin/kill on the daemon's own hot path.
+libc = "0.2"
+rmcp = { version = "1.4", features = ["server", "transport-io", "transport-streamable-http-server"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-util = "0.7"
+tokio = { version = "1", features = ["full"] }
+oxigraph = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = "0.4"
+anyhow = "1"
+thiserror = "2"
+rayon = "1.10"
+csv = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde_yaml = "0.9"
+calamine = { version = "0.30", features = ["dates"] }
+arrow = { version = "54", default-features = false, features = ["csv", "json"] }
+parquet = { version = "54", default-features = false, features = ["arrow"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
+duckdb = { version = "1", optional = true, features = ["bundled"] }
+tract-onnx = { version = "0.22", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+instant-distance = { version = "0.6", optional = true, features = ["with-serde"] }
+bincode = { version = "1.3", optional = true }
+sha2 = "0.10"
+dirs = "6"
+wasmi = { version = "1.1.0", optional = true }
+turbovec = { version = "1.0.0", default-features = false, optional = true }
+
+[features]
+default = []
+postgres = ["sqlx"]
+duckdb = ["dep:duckdb"]
+sql = ["postgres", "duckdb"]
+embeddings = ["tract-onnx", "tokenizers", "instant-distance", "bincode"]
+# Causal layer (#48): subprocess wrapper around PyWhy/DoWhy for backdoor
+# identification + adjustment estimation. Caller must have `python3` on PATH
+# and `pip install dowhy networkx pandas numpy`. The wrapper degrades to a
+# clean `pywhy_unavailable` error when imports fail; CIVeX falls back to the
+# structural proxy. Zero additional Rust dependencies — the entire feature
+# is shipped as embedded Python + subprocess plumbing.
+causal-pywhy = []
+# WASM plugin host: community tools compiled to wasm32-unknown-unknown, run
+# in-process behind onto_plugin_list / onto_plugin_call. Pure-Rust interpreter
+# (wasmi) with fuel metering — no system deps, the binary stays self-contained.
+plugins = ["dep:wasmi"]
+# TurboQuant-backed cosine index (Google Research arXiv:2504.19874) as an
+# alternative to the immutable instant-distance HNSW graph. Two properties the
+# HNSW index cannot offer: incremental add/remove without a full rebuild, and
+# 2-4 bit quantised storage. Implies `embeddings` because it replaces one of
+# that feature's two index backends; the Poincare index stays on
+# instant-distance (TurboQuant scores inner products, and hyperbolic distance
+# is not an inner product on the ambient coordinates).
+turbovec = ["dep:turbovec", "embeddings"]
+
+[lints.rust]
+# `cfg(kani)` is set by the Kani model checker's own compiler driver, never by
+# cargo, so an ordinary build has no way to know the name is real and warns that
+# the `#[cfg(kani)]` harnesses in `src/reason.rs` are a typo. Declaring it here
+# says the name is expected; it does not enable anything.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[dev-dependencies]
+tempfile = "3"
+wat = "1.256.0"
+# Already a normal dependency; repeated here so a test can assert that a
+# `config.toml` section really does carry the key it claims to. A setting that
+# only a setter can move is not a setting, and two reasoner budgets were in that
+# position. No new crate enters the tree.
+toml = "0.8"
+# Property testing for the certificate boundary (docs/trusted-computing-base.md).
+# The Lean proofs are conditional on the Rust writing down the truth, and that
+# boundary is a tab-separated format carrying arbitrary RDF terms: exactly the
+# shape where a hand-written example passes and an adversarial one forges a
+# derivation. DEV-ONLY on purpose. The shipped binary's dependency surface does
+# not grow by a single crate.
+proptest = "1"
+
+# A patched Oxigraph, pinned by revision.
+#
+# `Store::snapshot` is not in Oxigraph 0.5.9. It is a read view pinned to one
+# state that takes no lock, and decision 0010 explains at length why neither
+# thing the unpatched crate offers will do: a transaction pins the state but
+# stops every writer for the length of a reasoning run on the memory backend,
+# and copying the graph costs about 221 bytes a triple. The patch is a public
+# wrapper over `Storage::snapshot`, which `Store::len` and
+# `Store::quads_for_pattern` already call internally on every read.
+#
+# Pinned by REVISION and not by branch, so that what CI builds is what was
+# reviewed. Upstream at oxigraph/oxigraph; when it lands this stanza goes and
+# the version bound below is all that remains.
+[patch.crates-io]
+oxigraph = { git = "https://github.com/fabio-rovai/oxigraph.git", rev = "abf36ef22b61f9c4d810b94b647d500c05ee791c" }

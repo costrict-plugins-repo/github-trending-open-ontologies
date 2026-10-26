@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "open-ontologies-lite"
+version = "0.5.0"
+description = "Lightweight Python bridge to the Oxigraph RDF/OWL engine, MCP server included. No Rust toolchain, no compilation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Fabio Rovai" }]
+keywords = ["ontology", "rdf", "owl", "sparql", "oxigraph", "mcp", "knowledge-graph"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering",
+]
+# The library half needs a triple store and nothing else. `mcp` is imported in
+# exactly one module, server.py, and requiring it here made every consumer of
+# the library install an MCP server stack they had not asked for. That is not
+# only weight: `mcp` pulls a starlette major that current fastapi does not
+# accept, so installing this package into a project that uses fastapi removes
+# fastapi. Measured against semantica 0.6.6, whose pyproject declares
+# `fastapi>=0.109.2`: installing 0.4.0 uninstalled it, and every import of
+# `semantica/explorer` failed afterwards.
+#
+# The Horn reasoner and the certificate bridge in `open_ontologies_lite/horn/`
+# add ZERO runtime dependencies and no extra. The forward chainer is pure Python
+# over the pyoxigraph above; the rest is `subprocess`, `json`, `hashlib` and
+# `importlib.resources`. There is no pyo3, no maturin and no binding to the Rust
+# crate, because the stated value of this package is that it installs without
+# compiling anything, and a Rust toolchain requirement would cost exactly the
+# audience the Rust engine already cannot reach.
+#
+# The Lean checker `oo-horn` is an external BINARY, built from `lean/` by
+# `lake build`. It is deliberately not packaged and is not a dependency of any
+# kind, not even an optional extra: a wheel cannot ship a Lean toolchain, and
+# pretending otherwise in the metadata would make `pip install` fail for
+# everyone who only wants the reasoner. The package is fully functional without
+# it and says loudly, in every report, when a certificate went unchecked.
+dependencies = [
+    "pyoxigraph>=0.5,<0.6",
+]
+
+[project.optional-dependencies]
+# The MCP server entry point, `open-ontologies-lite` on the command line and
+# `python -m open_ontologies_lite`. The library API needs none of it.
+server = ["mcp>=1.2,<2"]
+shacl = ["pyshacl>=0.26"]
+align = ["hnswlib>=0.8"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+open-ontologies-lite = "open_ontologies_lite.server:main"
+
+[project.urls]
+Homepage = "https://github.com/fabio-rovai/open-ontologies"
+Repository = "https://github.com/fabio-rovai/open-ontologies"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/open_ontologies_lite"]

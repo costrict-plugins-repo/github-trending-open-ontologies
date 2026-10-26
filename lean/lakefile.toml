@@ -1,0 +1,153 @@
+name = "oocert"
+version = "0.1.0"
+defaultTargets = ["SelfId", "MatCert", "oo-matcert", "OOCert", "oo-cert", "oo-horn", "Shacl", "oo-shacl", "oo-refute", "Dl", "oo-dlmodel", "oo-dlrefute", "Fol", "oo-folmodel", "Institution", "Lrat", "oo-lrat", "Fo", "oo-resolution"]
+
+# Every library and executable here is in defaultTargets on purpose. A target
+# left out of the default set is not built by a bare `lake build`, which is what
+# the CI job runs, so its proofs can fail to compile while the gate reports
+# success. That happened once, on 14 September 2026: the SHACL layer did not
+# compile at the commit that carried it and CI was green over it, because
+# `Shacl` was not a default target. Anything added here must be added there.
+#
+# Core Lean only. No Mathlib, no external packages: the checker's trust surface
+# is the Lean kernel plus what is written in this directory, and it should stay
+# small enough to read in an afternoon.
+
+[[lean_lib]]
+name = "OOCert"
+
+[[lean_exe]]
+name = "oo-cert"
+root = "Main"
+
+[[lean_exe]]
+name = "oo-horn"
+root = "HMain"
+
+# SHACL Core, mechanised. Separate from `OOCert` on purpose: the derivation
+# checker never looks inside a term and this one has to, so the two keep their
+# own term modules and neither can break the other's build.
+[[lean_lib]]
+name = "Shacl"
+roots = ["Shacl.All"]
+globs = ["Shacl.+"]
+
+[[lean_exe]]
+name = "oo-shacl"
+root = "ShaclMain"
+
+# The refutation checker. `oo-refute/1` is a second certificate format: a
+# derivation prefix plus one step that concludes contradiction rather than a
+# triple. Its own executable because its verdict is a different sentence from
+# `oo-cert`'s, and the two must never be confused for one another.
+[[lean_exe]]
+name = "oo-refute"
+root = "RefuteMain"
+
+[[lean_lib]]
+name = "Dl"
+
+[[lean_exe]]
+name = "oo-dlmodel"
+root = "DlMain"
+
+# The refutation half. `oo-dlmodel` certifies that an ontology HAS a model by
+# exhibiting one; this certifies that it has NONE by exhibiting a closed
+# tableau. Its own executable for the same reason `oo-refute` is separate from
+# `oo-cert`: the verdicts are different sentences and must never be read for
+# one another. Exit 1 here means the certificate did not check, never that the
+# ontology is consistent.
+[[lean_exe]]
+name = "oo-dlrefute"
+root = "DlRefuteMain"
+
+# The first-order model certificate. A solver's `sat` answer plus the finite
+# structure it built, checked against the problem it was given. Separate from
+# `Dl` on purpose and NOT built on it: `Dl.Sat` evaluates at one free variable
+# over a carrier given as a list of names, `Fol.eval` threads an environment
+# over a carrier that is a type, and `Dl.WellFormed` would make `Fol` REJECT
+# genuine models. The six reasons are in decision 0006 so that nobody
+# re-litigates the split in six months.
+[[lean_lib]]
+name = "Fol"
+
+[[lean_exe]]
+name = "oo-folmodel"
+root = "FolMain"
+
+# The institution layer: what a logic is, what a translation between two logics
+# is, and the satisfaction condition that neither may be built without. A
+# separate library from `OOCert` because `Main.lean` imports `OOCert` and this
+# has no run-time part: it is theorems over the model classes the other
+# libraries already define, it pulls in `Fol`, and no executable reads it. In
+# defaultTargets, like everything else here, for the reason at the top of this
+# file.
+[[lean_lib]]
+name = "Institution"
+
+# Propositional proof checking. A solver's `unsat` is an opinion while nothing
+# reads the proof behind it, which is why the first-order family is drawn as
+# `opinion` and not `certificate`. An LRAT line is one clause plus the
+# identifiers of the clauses that make it follow, and checking it is unit
+# propagation over those few: expensive to find, cheap to check, which is the
+# same split every other checker here rests on.
+#
+# Separate from `Fol` on purpose. `Fol` certifies that a problem HAS a model by
+# exhibiting one; this certifies that a propositional formula has NONE by
+# exhibiting a refutation. Different sentences, different executables.
+[[lean_lib]]
+name = "Lrat"
+
+[[lean_exe]]
+name = "oo-lrat"
+root = "LratMain"
+
+# First-order resolution, checked.
+#
+# Decision 0005 says a superposition proof cannot be certified here because it
+# "needs a verified first-order calculus with unification that does not exist
+# in core Lean". The unification half of that is avoidable: a checker does not
+# need an algorithm that FINDS a most general unifier, it needs to confirm that
+# a substitution it was HANDED makes two literals complementary, which is an
+# equality on terms. The prover searches, the certificate carries the
+# substitution, the checker applies it and compares.
+#
+# Separate from `Fol`, which certifies SATISFIABILITY by exhibiting a finite
+# model. This certifies UNSATISFIABILITY by exhibiting a refutation, and the
+# two are different sentences.
+[[lean_lib]]
+name = "Fo"
+
+[[lean_exe]]
+name = "oo-resolution"
+root = "FoMain"
+
+
+# SHA-256, so a checker can report the digest of the binary that is running.
+# Core Lean only, like everything here. NOT verified and the module header says
+# so: what stands behind it is the published test vectors and agreement with
+# `sha256sum`, both checked from the Rust side.
+[[lean_lib]]
+name = "SelfId"
+roots = ["SelfId.All"]
+globs = ["SelfId.+"]
+
+
+# A numeric claim, checked. Matrix multiplication over the INTEGERS, recomputed
+# against the textbook definition, with `MatCert.mul_of_check` saying what an
+# acceptance means.
+#
+# Integers only, and that is the whole design. Freivalds' O(n^2) check is sound
+# only probabilistically, which needs probability theory this development does
+# not have and will not take a dependency for; and a proof over the reals says
+# NOTHING about IEEE-754, where rounding makes a correct product compare unequal
+# and an incorrect one compare equal. Both of those live in Rust as this
+# engine's opinion, with their bounds printed and the certified word withheld.
+[[lean_lib]]
+name = "MatCert"
+roots = ["MatCert.All"]
+globs = ["MatCert.+"]
+
+[[lean_exe]]
+name = "oo-matcert"
+root = "MatCertMain"

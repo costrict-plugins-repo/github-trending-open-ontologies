@@ -1,0 +1,3574 @@
+use std::sync::Arc;
+
+use rmcp::{
+    ServerHandler, RoleServer, tool, tool_handler, tool_router,
+    prompt, prompt_handler, prompt_router,
+    handler::server::{tool::ToolRouter, router::prompt::PromptRouter, wrapper::Parameters},
+    model::{
+        ServerCapabilities, ServerInfo, Tool,
+        PromptMessage, PromptMessageRole, GetPromptResult,
+        GetPromptRequestParams, PaginatedRequestParams, ListPromptsResult,
+    },
+    service::RequestContext,
+};
+use crate::config::expand_tilde;
+use crate::graph::GraphStore;
+use crate::inputs::*;
+use crate::state::StateDb;
+
+// ─── OpenOntologiesServer ───────────────────────────────────────────────────
+
+/// MCP server that exposes all Open Ontologies tools to Claude via stdin/stdout.
+#[derive(Clone)]
+pub struct OpenOntologiesServer {
+    tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
+    db: StateDb,
+    graph: Arc<GraphStore>,
+    session_id: String,
+    governance_webhook: Option<String>,
+    /// Registry tracking the active ontology + compile cache + TTL eviction.
+    registry: Arc<crate::registry::OntologyRegistry>,
+    /// Configured ontology repository directories, expanded and deduplicated.
+    /// Empty when none are configured. Used by `onto_repo_list` /
+    /// `onto_repo_load`.
+    ontology_dirs: Arc<Vec<std::path::PathBuf>>,
+    /// What the operator's filter did to this server's surface, so `onto_status`
+    /// can name the profile in force and the count it withheld. A user hunting a
+    /// tool that is not advertised has to be able to read the reason out of the
+    /// server rather than infer it from the deployment.
+    tool_surface: Arc<crate::toolfilter::ToolSurface>,
+    #[cfg(feature = "embeddings")]
+    vecstore: Arc<std::sync::Mutex<crate::vecstore::VecStore>>,
+    #[cfg(feature = "embeddings")]
+    text_embedder: Option<Arc<crate::embed::TextEmbedderProvider>>,
+}
+
+impl OpenOntologiesServer {
+    /// Create a new server with all tools wired to domain services.
+    pub fn new(db: StateDb) -> Self {
+        Self::new_with_options(db, Arc::new(GraphStore::new()), None)
+    }
+
+    /// Create a new server sharing an existing graph store (for HTTP mode where
+    /// all sessions must see the same in-memory triples).
+    pub fn new_with_graph(db: StateDb, graph: Arc<GraphStore>) -> Self {
+        Self::new_with_options(db, graph, None)
+    }
+
+    /// Create a new server with all options including optional governance webhook.
+    pub fn new_with_options(db: StateDb, graph: Arc<GraphStore>, governance_webhook: Option<String>) -> Self {
+        Self::new_with_full_options(db, graph, governance_webhook, Default::default())
+    }
+
+    /// Create a new server with all options including embedding config.
+    pub fn new_with_full_options(
+        db: StateDb,
+        graph: Arc<GraphStore>,
+        governance_webhook: Option<String>,
+        _embed_config: crate::config::EmbeddingsConfig,
+    ) -> Self {
+        Self::new_with_registry_options(
+            db,
+            graph,
+            governance_webhook,
+            _embed_config,
+            crate::config::CacheConfig::default(),
+            crate::toolfilter::ToolFilter::default(),
+        )
+    }
+
+    /// Full constructor, including cache configuration and tool filter.
+    pub fn new_with_registry_options(
+        db: StateDb,
+        graph: Arc<GraphStore>,
+        governance_webhook: Option<String>,
+        _embed_config: crate::config::EmbeddingsConfig,
+        cache_config: crate::config::CacheConfig,
+        tool_filter: crate::toolfilter::ToolFilter,
+    ) -> Self {
+        Self::new_with_repo_options(
+            db,
+            graph,
+            governance_webhook,
+            _embed_config,
+            cache_config,
+            tool_filter,
+            Vec::new(),
+        )
+    }
+
+    /// Full constructor with on-disk ontology repo directories.
+    ///
+    /// `ontology_dirs` lists host directories that the `onto_repo_list` and
+    /// `onto_repo_load` tools enumerate. They are stored verbatim (already
+    /// resolved by the caller through `crate::config::resolve_ontology_dirs`).
+    pub fn new_with_repo_options(
+        db: StateDb,
+        graph: Arc<GraphStore>,
+        governance_webhook: Option<String>,
+        _embed_config: crate::config::EmbeddingsConfig,
+        cache_config: crate::config::CacheConfig,
+        tool_filter: crate::toolfilter::ToolFilter,
+        ontology_dirs: Vec<std::path::PathBuf>,
+    ) -> Self {
+        let lineage = crate::lineage::LineageLog::with_governance_webhook(db.clone(), governance_webhook.clone());
+        let session_id = lineage.new_session();
+
+        // Build the registry. If construction fails (e.g. cache dir cannot be
+        // created) fall back to a disabled registry so the server still starts.
+        let registry = match crate::registry::OntologyRegistry::new(
+            graph.clone(),
+            db.clone(),
+            cache_config.clone(),
+        ) {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                tracing::warn!("ontology registry init failed: {}; cache disabled", e);
+                let mut disabled = cache_config.clone();
+                disabled.enabled = false;
+                disabled.dir = std::env::temp_dir().to_string_lossy().to_string();
+                Arc::new(
+                    crate::registry::OntologyRegistry::new(graph.clone(), db.clone(), disabled)
+                        .expect("temp_dir registry"),
+                )
+            }
+        };
+
+        // A tool this build cannot serve is not advertised. This runs BEFORE
+        // the operator's filter and does not consult it: a description in
+        // `tools/list` is a promise, and eight of the registered tools are
+        // behind a Cargo feature whose absence turns every call into
+        // "Compiled without X feature". See `toolfilter::FEATURE_GATED_TOOLS`.
+        let mut tool_router = Self::tool_router();
+        let compiled_in = tool_router.list_all().len();
+        let unavailable = crate::toolfilter::remove_unavailable(&mut tool_router);
+        if !unavailable.is_empty() {
+            tracing::info!(
+                "not advertising {} tools this build cannot serve: {}",
+                unavailable.len(),
+                unavailable
+                    .iter()
+                    .map(|(t, f)| format!("{t} (needs --features {f})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        // Counted after the feature gate and before the operator's filter, so
+        // `withheld_by_filter` is about the filter and nothing else.
+        let servable = tool_router.list_all().len();
+
+        // Apply tool filter by removing routes from the router.
+        let removed = tool_filter.apply(&mut tool_router);
+        let tool_surface = Arc::new(tool_filter.describe(
+            compiled_in,
+            servable,
+            servable.saturating_sub(removed.len()),
+        ));
+        if !removed.is_empty() {
+            tracing::info!(
+                "tool profile {:?}: advertising {} of {} servable tools, {} withheld: {:?}",
+                tool_surface.profile,
+                tool_surface.exposed,
+                tool_surface.servable_in_this_build,
+                tool_surface.withheld_by_filter,
+                removed
+            );
+        }
+
+        #[cfg(feature = "embeddings")]
+        let (vecstore, text_embedder) = {
+            // The model and the fingerprint over it are built ONCE PER PROCESS
+            // and cloned into every session, not rebuilt here (#262). This
+            // constructor is what the HTTP arm hands `StreamableHttpService` as
+            // a per-session factory, so what it builds, every connecting
+            // session builds again: a tract optimize pass over a 470 MB ONNX
+            // graph, a second resident copy of that graph, and a sha256 over
+            // the same file. None of it can differ between sessions that were
+            // handed the same configuration. See `embed::shared_embeddings` for
+            // why the fingerprint has to be taken at the same instant as the
+            // model rather than recomputed here.
+            //
+            // The vector store is deliberately NOT shared. It is per-session
+            // mutable state: `onto_embed` upserts into it and `onto_hnsw_build`
+            // rebuilds its index, so one store behind one mutex would make one
+            // session's embeddings appear inside another's and let one session's
+            // index parameters govern everybody's searches. That is a change to
+            // what the server does, not an optimisation, and it belongs to its
+            // own issue.
+            let shared = crate::embed::shared_embeddings(&_embed_config);
+
+            // Set the fingerprint BEFORE `load_from_db`: the load path is where
+            // a configuration change is detected, and detecting it afterwards
+            // would mean the incompatible vectors are already in memory and
+            // about to be searched.
+            let mut vs = crate::vecstore::VecStore::new(db.clone())
+                .with_embeddings_fingerprint(shared.fingerprint.clone());
+            tracing::debug!(
+                "embedding configuration fingerprint: {}",
+                shared.description
+            );
+            let _ = vs.load_from_db();
+
+            // One line per session, exactly as before. Only the work behind the
+            // line moved.
+            let embedder = match (&shared.provider, &shared.init_error) {
+                (Some(e), _) => {
+                    tracing::info!(
+                        "embeddings enabled (provider = {})",
+                        e.provider_name()
+                    );
+                    Some(e.clone())
+                }
+                (None, None) => {
+                    tracing::info!(
+                        "embeddings configured but no provider available (model files missing or provider disabled)"
+                    );
+                    None
+                }
+                (None, Some(err)) => {
+                    tracing::warn!("failed to initialise embedding provider: {}", err);
+                    None
+                }
+            };
+            (Arc::new(std::sync::Mutex::new(vs)), embedder)
+        };
+
+        Self {
+            tool_router,
+            prompt_router: Self::prompt_router(),
+            db,
+            graph,
+            session_id,
+            governance_webhook,
+            registry,
+            ontology_dirs: Arc::new(ontology_dirs),
+            tool_surface,
+            #[cfg(feature = "embeddings")]
+            vecstore,
+            #[cfg(feature = "embeddings")]
+            text_embedder,
+        }
+    }
+
+    /// Return the list of all registered tool definitions.
+    pub fn list_tool_definitions(&self) -> Vec<Tool> {
+        self.tool_router.list_all()
+    }
+
+    /// The body of `onto_status`, callable without going through MCP.
+    ///
+    /// `onto_status` is a private `#[tool]` method, so a test that wants to
+    /// assert on what a client is TOLD would otherwise assert on the fields one
+    /// by one and could pass while the JSON said something else.
+    pub fn status_json(&self) -> String {
+        serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "tools": self.tool_router.list_all().len(),
+            "triples_loaded": self.graph.triple_count(),
+            // Always present and always naming the profile, even under `full`.
+            // Reporting it only when something was withheld would mean the
+            // absence of the field had to be read as "nothing was withheld",
+            // and a field that must be read by its absence gets missed.
+            "tool_surface": &*self.tool_surface,
+            "tool_profiles_available": crate::toolfilter::profiles(),
+        })
+        .to_string()
+    }
+
+    /// Access the ontology registry (for tests and the HTTP server eviction loop).
+    pub fn registry(&self) -> Arc<crate::registry::OntologyRegistry> {
+        self.registry.clone()
+    }
+
+    /// The embedding provider this session was given, if it has one.
+    ///
+    /// Exposed so a test can hold two sessions' providers side by side and ask
+    /// whether they are the same allocation. Counting builds says the expensive
+    /// work happened once; `Arc::ptr_eq` over this says the second session is
+    /// actually served by the first session's model rather than by a second
+    /// copy that merely cost nothing to make.
+    #[cfg(feature = "embeddings")]
+    pub fn text_embedder(&self) -> Option<Arc<crate::embed::TextEmbedderProvider>> {
+        self.text_embedder.clone()
+    }
+
+    fn lineage(&self) -> crate::lineage::LineageLog {
+        crate::lineage::LineageLog::with_governance_webhook(self.db.clone(), self.governance_webhook.clone())
+    }
+
+    fn monitor(&self) -> crate::monitor::Monitor {
+        crate::monitor::Monitor::new(self.db.clone(), self.graph.clone())
+    }
+}
+
+// ─── Tool definitions ───────────────────────────────────────────────────────
+
+#[tool_router]
+impl OpenOntologiesServer {
+
+    fn err_json(msg: impl std::fmt::Display) -> String {
+        serde_json::json!({ "error": msg.to_string() }).to_string()
+    }
+
+    // ── Status ──────────────────────────────────────────────────────────────
+
+    #[tool(name = "onto_status", description = "Returns health status of the Open Ontologies server, including which tool profile is in force and how many tools it withheld. If a tool you expected is missing from tools/list, `tool_surface` is where the reason is: the operator can re-run with `--tool-profile full` (the default) or name the profile that carries it.")]
+    fn onto_status(&self) -> String {
+        self.status_json()
+    }
+
+    // ── Ontology ────────────────────────────────────────────────────────────
+
+    #[tool(name = "onto_validate", description = "Validate RDF/OWL syntax. Accepts a file path or inline content. A file may be Turtle, N-Triples, RDF/XML, N-Quads, TriG, JSON-LD or OWL 2 functional syntax (OFN), and the content is sniffed before the extension is trusted, so an OFN document published as `.owl` is read as OFN. Inline content is Turtle unless it opens with `Prefix(` or `Ontology(`, in which case it is OFN. An OFN construct the reader does not translate is an error naming the construct, its count and its first line, never a silent drop.")]
+    async fn onto_validate(&self, Parameters(input): Parameters<OntoValidateInput>) -> String {
+        use crate::ontology::OntologyService;
+        if input.inline.unwrap_or(false) {
+            OntologyService::validate_string(&input.input).unwrap_or_else(Self::err_json)
+        } else {
+            OntologyService::validate_file(&input.input).unwrap_or_else(Self::err_json)
+        }
+    }
+
+    #[tool(name = "onto_convert", description = "Convert an ontology file to turtle, ntriples, rdfxml, nquads, trig or ofn (OWL 2 functional syntax). Reads every format onto_load reads, OFN included, so this also turns an OFN document into RDF and back. `to: \"ofn\"` writes the inverse of the reader's W3C mapping, one axiom per line, in a byte-identical order on every run, and returns JSON: `content` (or `path` when `output` is given) plus `constructs_not_exported`, which names and counts every triple that maps back to no OWL 2 axiom (an unrecognised blank-node structure, a malformed rdf:List, a reserved-vocabulary triple outside any axiom) instead of dropping it, and `constructs_not_round_trippable` for what was written but will not read back as the same graph.")]
+    async fn onto_convert(&self, Parameters(input): Parameters<OntoConvertInput>) -> String {
+        if crate::ofn_writer::is_ofn_format(&input.to) {
+            return match crate::ofn_writer::convert_file(&input.path) {
+                Ok(out) => {
+                    let mut report = out.report_json();
+                    if let Some(output) = input.output {
+                        if let Err(e) = std::fs::write(&output, &out.text) {
+                            return Self::err_json(e);
+                        }
+                        report["ok"] = serde_json::json!(true);
+                        report["path"] = serde_json::json!(output);
+                    } else {
+                        report["content"] = serde_json::json!(out.text);
+                    }
+                    report.to_string()
+                }
+                Err(e) => Self::err_json(e),
+            };
+        }
+        let store = GraphStore::new();
+        match store.load_file(&input.path) {
+            Ok(_) => {
+                match store.serialize(&input.to) {
+                    Ok(content) => {
+                        if let Some(output) = input.output {
+                            match std::fs::write(&output, &content) {
+                                Ok(_) => serde_json::json!({"ok":true,"path":output,"format":input.to}).to_string(),
+                                Err(e) => Self::err_json(e),
+                            }
+                        } else {
+                            content
+                        }
+                    }
+                    Err(e) => Self::err_json(e),
+                }
+            }
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_load", description = "Load an ontology file or inline Turtle content into the in-memory ontology store. A file may be Turtle, N-Triples, RDF/XML, N-Quads, TriG, JSON-LD or OWL 2 functional syntax (OFN, `.ofn`, or any extension whose content opens with `Prefix(` or `Ontology(`, which covers OFN published as `.owl`); OFN is translated to the RDF graph the W3C OWL 2 mapping assigns it, and a construct the reader does not translate fails the load by name rather than being dropped. When given a file path, the parsed graph is also written to a fast N-Triples compile cache (in `[cache] dir`) so subsequent loads from the same source skip parsing. Optional `name`, `auto_refresh`, and `force_recompile` flags control caching/refresh behavior.")]
+    async fn onto_load(&self, Parameters(input): Parameters<OntoLoadInput>) -> String {
+        if let Some(turtle) = input.turtle {
+            // Inline turtle bypasses the registry/cache (no source file).
+            match self.graph.load_turtle(&turtle, None) {
+                Ok(count) => format!(r#"{{"ok":true,"triples_loaded":{},"source":"inline"}}"#, count),
+                Err(e) => Self::err_json(e),
+            }
+        } else if let Some(path) = input.path {
+            let path = expand_tilde(&path);
+            let opts = crate::registry::LoadOptions {
+                name: input.name,
+                auto_refresh: input.auto_refresh.unwrap_or(false),
+                force_recompile: input.force_recompile.unwrap_or(false),
+            };
+            match self.registry.load_file(&path, opts) {
+                Ok(res) => serde_json::json!({
+                    "ok": true,
+                    "triples_loaded": res.triple_count,
+                    "path": res.source_path,
+                    "name": res.name,
+                    "origin": res.origin,
+                    "cache_path": res.cache_path,
+                }).to_string(),
+                Err(e) => Self::err_json(e),
+            }
+        } else {
+            r#"{"error":"Either 'path' or 'turtle' must be provided"}"#.to_string()
+        }
+    }
+
+    #[tool(name = "onto_repo_list", description = "List RDF/OWL files in the configured ontology repository directories ([general] ontology_dirs). Returns metadata for each candidate file (path, name, size, mtime, is_cached, is_active). Use this in containerized/server deployments to discover ontologies without knowing their paths in advance. Optional `dir` (must be under a configured repo dir), `recursive`, `glob`, `limit`, `offset` filters.")]
+    fn onto_repo_list(&self, Parameters(input): Parameters<OntoRepoListInput>) -> String {
+        let repos = self.ontology_dirs.as_ref();
+        if repos.is_empty() {
+            return r#"{"error":"no ontology_dirs configured; set [general] ontology_dirs in config.toml or OPEN_ONTOLOGIES_ONTOLOGY_DIRS"}"#.to_string();
+        }
+        let recursive = input.recursive.unwrap_or(false);
+        let limit = input.limit.unwrap_or_else(crate::runtime::repo_default_list_limit);
+        let offset = input.offset.unwrap_or(0);
+
+        let entries = if let Some(dir) = input.dir.as_deref() {
+            match crate::repo::resolve_within_repos(dir, repos) {
+                Ok((start, repo_root)) => crate::repo::list_one(&repo_root, &start, recursive),
+                Err(e) => {
+                    return Self::err_json(e);
+                }
+            }
+        } else {
+            crate::repo::list_all(repos, recursive)
+        };
+
+        let filtered: Vec<&crate::repo::RepoEntry> = entries
+            .iter()
+            .filter(|e| {
+                if let Some(g) = input.glob.as_deref() {
+                    let name = e
+                        .path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    crate::repo::glob_match(g, name)
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let total = filtered.len();
+
+        // Snapshot cached names + currently active name for is_cached / is_active.
+        let cached_names: std::collections::HashSet<String> = self
+            .registry
+            .cache()
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        let active_name = self
+            .registry
+            .status()
+            .get("active")
+            .and_then(|a| a.get("name"))
+            .and_then(|n| n.as_str())
+            .map(|s| s.to_string());
+
+        let items: Vec<serde_json::Value> = filtered
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|e| {
+                serde_json::json!({
+                    "path": e.path.to_string_lossy(),
+                    "relative": e.relative.to_string_lossy(),
+                    "repo_dir": e.repo_dir.to_string_lossy(),
+                    "name": e.name,
+                    "size": e.size,
+                    "mtime": e.mtime_secs,
+                    "is_cached": cached_names.contains(&e.name),
+                    "is_active": active_name.as_deref() == Some(e.name.as_str()),
+                })
+            })
+            .collect();
+
+        let repo_dirs: Vec<String> = repos
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+
+        serde_json::json!({
+            "ok": true,
+            "ontology_dirs": repo_dirs,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "count": items.len(),
+            "items": items,
+        })
+        .to_string()
+    }
+
+    #[tool(name = "onto_repo_load", description = "Load an ontology from one of the configured repository directories ([general] ontology_dirs) into the active store. The `name` argument can be a bare file stem, a relative path, or an absolute path inside a configured repo. Reuses the same compile-cache / TTL-eviction path as `onto_load`.")]
+    async fn onto_repo_load(&self, Parameters(input): Parameters<OntoRepoLoadInput>) -> String {
+        let repos = self.ontology_dirs.as_ref();
+        let path = match crate::repo::resolve_load_target(&input.name, repos) {
+            Ok(p) => p,
+            Err(e) => {
+                return Self::err_json(e);
+            }
+        };
+        let opts = crate::registry::LoadOptions {
+            name: input.registry_name,
+            auto_refresh: input.auto_refresh.unwrap_or(false),
+            force_recompile: input.force_recompile.unwrap_or(false),
+        };
+        match self.registry.load_file(&path.to_string_lossy(), opts) {
+            Ok(res) => serde_json::json!({
+                "ok": true,
+                "triples_loaded": res.triple_count,
+                "path": res.source_path,
+                "name": res.name,
+                "origin": res.origin,
+                "cache_path": res.cache_path,
+            })
+            .to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_query", description = "Run a SPARQL query against the loaded ontology store. If the active ontology has been evicted from memory (idle TTL), it is transparently reloaded from the compile cache before the query runs.")]
+    async fn onto_query(&self, Parameters(input): Parameters<OntoQueryInput>) -> String {
+        if let Err(e) = self.registry.ensure_loaded() {
+            return Self::err_json(format!("ensure_loaded: {e}"));
+        }
+        self.graph.sparql_select(&input.query).unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_save", description = "Save the current ontology store to a file")]
+    async fn onto_save(&self, Parameters(input): Parameters<OntoSaveInput>) -> String {
+        if let Err(e) = self.registry.ensure_loaded() {
+            return Self::err_json(format!("ensure_loaded: {e}"));
+        }
+        let format = input.format.as_deref().unwrap_or("turtle");
+        let path = expand_tilde(&input.path);
+        match self.graph.save_file(&path, format) {
+            Ok(_) => serde_json::json!({"ok":true,"path":path,"format":format}).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_defects", description = "Check the ONTOLOGY itself, before any data is judged against it. Reports eight kinds of self-contradicting or self-defeating declaration: transitive_and_functional, symmetric_and_asymmetric, subclass_cycle, sub_property_cycle, disjoint_with_ancestor, inherited_disjoint, self_inverse, inverse_not_mutual. This is a different question from onto_dl_check: a transitive functional property is satisfiable and is still a trap, because the pair manufactures contradictions as soon as instances arrive. Run it after onto_load and before trusting any fact-level result, and on every marketplace pack before adopting it. Each kind is listed at most 50 times; the full total is reported under `truncated`.")]
+    fn onto_defects(&self) -> String {
+        if let Err(e) = self.registry.ensure_loaded() {
+            return Self::err_json(format!("ensure_loaded: {e}"));
+        }
+        crate::defects::Defects::check(&self.graph).unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_dlp_boundary", description = "Ask which of YOUR axioms the rule engine can actually SEE, before trusting a reasoning result. A certificate from onto_reason is a sound proof about the axioms the rules read, and it says nothing at all about the ones no rule fires on. A user can reason, get a green machine-checked certificate, and never learn that a third of the TBox was invisible to the rule table. This is that second question, and it is in the same register as onto_defects: run it after onto_load and BEFORE trusting any onto_reason result. TWO DIMENSIONS THAT ARE NEVER MERGED, because one is a rewrite of your ontology and the other is a patch to this engine. (1) THE FRAGMENT: is the axiom expressible as Horn rules over triple patterns at all? The line drawn is OWL 2 RL's class grammar (OWL 2 Profiles section 4.3), and `outside` there is a fact about the LANGUAGE that would hold of a perfect OWL 2 RL engine: a disjunction in the consequent, an existential in the head, a cardinality restriction, a negation in the antecedent. Each such axiom is listed individually with the reason. (2) THIS ENGINE: is there a rule in the table that fires on it? owl:hasKey and owl:propertyChainAxiom are perfectly Horn, OWL 2 RL has prp-key and prp-spo2 for them, and this engine implements neither, so those axioms are INSIDE the fragment and still invisible. They are reported in `inside_the_fragment_but_a_rule_is_not_implemented` and never in `outside_the_fragment`. An axiom that splits soundly gets a third bucket of its own, `partially_inside_the_fragment`, because a bucket called `outside` holding an axiom the rules half evaluate would be false in its own name: `A subClassOf (B and Out)` keeps its `A subClassOf B` half, and an owl:equivalentClass with an existential on one side keeps the direction cls-svf1 evaluates. `not_fully_seen_by_the_rule_table` is the headline and carries the three causes separately, because they are fixed in three different places. A conjunction in the ANTECEDENT does not split, because dropping a conjunct from a rule body makes it fire more often. The rule-table figures (78 OWL 2 RL rules, 29 evaluated in the fixpoint, 10 more detected only as a clash, 7 that conclude false and are not looked for, and the names of the rest) are DERIVED from reason::RULES_EVALUATED and reason::CLASH_RULES_NOT_DETECTED rather than typed. Every triple in the store lands in an axiom bucket or in a counted `not_classified` bucket, so nothing is passed over in silence. This is NOT a consistency check and states no verdict about satisfiability.")]
+    fn onto_dlp_boundary(&self) -> String {
+        if let Err(e) = self.registry.ensure_loaded() {
+            return Self::err_json(format!("ensure_loaded: {e}"));
+        }
+        crate::dlp::DlpBoundary::check(&self.graph).unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_stats", description = "Get statistics about the loaded ontology (triple count, classes, properties, individuals)")]
+    fn onto_stats(&self) -> String {
+        if let Err(e) = self.registry.ensure_loaded() {
+            return Self::err_json(format!("ensure_loaded: {e}"));
+        }
+        self.graph.get_stats().unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_diff", description = "Compare two ontology files and show added/removed triples")]
+    async fn onto_diff(&self, Parameters(input): Parameters<OntoDiffInput>) -> String {
+        use crate::ontology::OntologyService;
+        let old = match std::fs::read_to_string(&input.old_path) {
+            Ok(c) => c,
+            Err(e) => return Self::err_json(format!("Cannot read {}: {}", input.old_path, e)),
+        };
+        let new = match std::fs::read_to_string(&input.new_path) {
+            Ok(c) => c,
+            Err(e) => return Self::err_json(format!("Cannot read {}: {}", input.new_path, e)),
+        };
+        OntologyService::diff(&old, &new).unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_lint", description = "Check an ontology for quality issues: missing labels, comments, domains, ranges")]
+    async fn onto_lint(&self, Parameters(input): Parameters<OntoLintInput>) -> String {
+        use crate::ontology::OntologyService;
+        let content = if input.inline.unwrap_or(false) {
+            input.input.clone()
+        } else {
+            match std::fs::read_to_string(&input.input) {
+                Ok(c) => c,
+                Err(e) => return Self::err_json(e),
+            }
+        };
+        OntologyService::lint_with_feedback(&content, Some(&self.db)).unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_clear", description = "Clear all triples from the in-memory ontology store and unload the active registry slot (cache file is preserved)")]
+    fn onto_clear(&self) -> String {
+        // Drop the active registry entry; this also clears the graph.
+        let _ = self.registry.unload(false);
+        match self.graph.clear() {
+            Ok(_) => r#"{"ok":true,"message":"Store cleared"}"#.to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_unload", description = "Unload an ontology from memory. With no `name`, operates on the active ontology. With `name`, targets that cached entry — clears in-memory store if it is currently active. The on-disk compile cache is preserved unless `delete_cache=true`.")]
+    fn onto_unload(&self, Parameters(input): Parameters<OntoUnloadInput>) -> String {
+        let del = input.delete_cache.unwrap_or(false);
+        if let Some(name) = input.name.as_deref() {
+            return match self.registry.unload_named(name, del) {
+                Ok(true) => serde_json::json!({
+                    "ok": true,
+                    "unloaded": name,
+                    "deleted_cache": del,
+                }).to_string(),
+                Ok(false) => serde_json::json!({
+                    "ok": true,
+                    "unloaded": null,
+                    "name": name,
+                    "message": "entry exists in cache but was not in memory; pass delete_cache=true to remove it",
+                }).to_string(),
+                Err(e) => Self::err_json(e),
+            };
+        }
+        match self.registry.unload(del) {
+            Ok(Some(name)) => serde_json::json!({"ok": true, "unloaded": name, "deleted_cache": del}).to_string(),
+            Ok(None) => r#"{"ok":true,"unloaded":null,"message":"no active ontology"}"#.to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_recompile", description = "Force-recompile an ontology from its source file, ignoring the on-disk cache. With no `name`, recompiles the active ontology (and reloads it into memory). With `name`, recompiles that cached entry; if it is not the active slot, the in-memory store is left untouched.")]
+    fn onto_recompile(&self, Parameters(input): Parameters<OntoRecompileInput>) -> String {
+        let res = match input.name.as_deref() {
+            Some(name) => self.registry.recompile_named(name),
+            None => self.registry.recompile(),
+        };
+        match res {
+            Ok(res) => serde_json::json!({
+                "ok": true,
+                "name": res.name,
+                "triples_loaded": res.triple_count,
+                "origin": res.origin,
+                "cache_path": res.cache_path,
+            }).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_cache_status", description = "Inspect the compile cache: active ontology, all cached entries, and the cache configuration (TTL, auto_refresh, dir).")]
+    fn onto_cache_status(&self, Parameters(_input): Parameters<OntoCacheStatusInput>) -> String {
+        self.registry.status().to_string()
+    }
+
+    #[tool(name = "onto_cache_list", description = "List all cached ontologies with metadata (name, source_path, triple_count, source_mtime, source_size, cache_path, compiled_at, last_access_at) and runtime flags (is_active, in_memory). Lighter than onto_cache_status when you only need the list.")]
+    fn onto_cache_list(&self, Parameters(_input): Parameters<OntoCacheListInput>) -> String {
+        match self.registry.list_cached() {
+            Ok(entries) => serde_json::json!({
+                "ok": true,
+                "count": entries.len(),
+                "entries": entries,
+            }).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_cache_remove", description = "Remove a cached ontology by name. If it is the active slot, the in-memory store is unloaded first. By default the on-disk N-Triples cache file is also deleted; pass delete_file=false to keep it on disk.")]
+    fn onto_cache_remove(&self, Parameters(input): Parameters<OntoCacheRemoveInput>) -> String {
+        let delete_file = input.delete_file.unwrap_or(true);
+        match self.registry.unload_named(&input.name, delete_file) {
+            Ok(true) => serde_json::json!({
+                "ok": true,
+                "removed": input.name,
+                "deleted_file": delete_file,
+            }).to_string(),
+            Ok(false) => serde_json::json!({
+                "ok": true,
+                "removed": null,
+                "name": input.name,
+                "message": "entry was found but delete_file=false and it was not active, so nothing changed",
+            }).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_pull", description = "Fetch an ontology from a remote URL or SPARQL endpoint and load it into the store")]
+    async fn onto_pull(&self, Parameters(input): Parameters<OntoPullInput>) -> String {
+        use crate::graph::{GraphStore, SparqlAuth};
+        let auth = SparqlAuth::from_parts(input.username, input.password, input.token);
+        if input.sparql.unwrap_or(false) {
+            let query = input.query.as_deref().unwrap_or("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+            match GraphStore::fetch_sparql_auth(&input.url, query, &auth).await {
+                Ok(content) => {
+                    match self.graph.load_turtle(&content, None) {
+                        Ok(count) => serde_json::json!({"ok": true, "triples_loaded": count, "source": input.url}).to_string(),
+                        Err(e) => serde_json::json!({"error": format!("Parse error: {e}")}).to_string(),
+                    }
+                }
+                Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+            }
+        } else {
+            match GraphStore::fetch_url(&input.url).await {
+                Ok(content) => {
+                    match self.graph.load_turtle(&content, None) {
+                        Ok(count) => serde_json::json!({"ok": true, "triples_loaded": count, "source": input.url}).to_string(),
+                        Err(e) => serde_json::json!({"error": format!("Parse error: {e}")}).to_string(),
+                    }
+                }
+                Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+            }
+        }
+    }
+
+    #[tool(name = "onto_push", description = "Push the current ontology store to a remote SPARQL endpoint")]
+    async fn onto_push(&self, Parameters(input): Parameters<OntoPushInput>) -> String {
+        use crate::graph::{GraphStore, SparqlAuth};
+        let auth = SparqlAuth::from_parts(input.username, input.password, input.token);
+        match self.graph.serialize("ntriples") {
+            Ok(content) => {
+                match GraphStore::push_sparql_auth(&input.endpoint, &content, input.graph.as_deref(), &auth).await {
+                    Ok(msg) => serde_json::json!({"ok": true, "message": msg}).to_string(),
+                    Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+                }
+            }
+            Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+        }
+    }
+
+    #[tool(name = "onto_import", description = "Resolve and load all owl:imports from the currently loaded ontology")]
+    async fn onto_import(&self, Parameters(input): Parameters<OntoImportInput>) -> String {
+        use crate::graph::GraphStore;
+        let max_depth = input
+            .max_depth
+            .unwrap_or_else(crate::runtime::imports_max_depth);
+        let timeout_secs = crate::runtime::imports_request_timeout_secs();
+        let follow_remote = crate::runtime::imports_follow_remote();
+        let mut imported = Vec::new();
+        let mut to_import: Vec<String> = Vec::new();
+
+        // Build a per-call HTTP client honouring the configured timeout.
+        // Falls back to the bare `fetch_url` helper if construction fails.
+        let timed_client = if timeout_secs > 0 {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .build()
+                .ok()
+        } else {
+            None
+        };
+
+        let fetch = |url: String| {
+            let client = timed_client.clone();
+            async move {
+                if let Some(c) = client {
+                    let resp = c.get(&url).send().await?;
+                    if !resp.status().is_success() {
+                        anyhow::bail!("HTTP {}: {}", resp.status(), url);
+                    }
+                    Ok::<String, anyhow::Error>(resp.text().await?)
+                } else {
+                    GraphStore::fetch_url(&url).await
+                }
+            }
+        };
+
+        let query = "SELECT ?import WHERE { ?onto <http://www.w3.org/2002/07/owl#imports> ?import }";
+        if let Ok(result) = self.graph.sparql_select(query)
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result)
+                && let Some(results) = parsed["results"].as_array() {
+                    for row in results {
+                        if let Some(uri) = row["import"].as_str() {
+                            let uri = uri.trim_matches(|c| c == '<' || c == '>');
+                            to_import.push(uri.to_string());
+                        }
+                    }
+                }
+
+        let mut depth = 0;
+        while !to_import.is_empty() && depth < max_depth {
+            let batch = std::mem::take(&mut to_import);
+            for url in batch {
+                if imported.contains(&url) { continue; }
+                // Honour the `[imports] follow_remote` policy: in
+                // air-gapped or sandboxed deployments, refuse to fetch
+                // http(s):// imports rather than attempting them.
+                let is_remote = url.starts_with("http://") || url.starts_with("https://");
+                if is_remote && !follow_remote {
+                    imported.push(format!("SKIPPED:{}: remote imports disabled by [imports] follow_remote=false", url));
+                    continue;
+                }
+                match fetch(url.clone()).await {
+                    Ok(content) => {
+                        match self.graph.load_turtle(&content, None) {
+                            Ok(_count) => {
+                                imported.push(url.clone());
+                                if let Ok(result) = self.graph.sparql_select(query)
+                                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result)
+                                        && let Some(results) = parsed["results"].as_array() {
+                                            for row in results {
+                                                if let Some(uri) = row["import"].as_str() {
+                                                    let uri = uri.trim_matches(|c| c == '<' || c == '>').to_string();
+                                                    if !imported.contains(&uri) && !to_import.contains(&uri) {
+                                                        to_import.push(uri);
+                                                    }
+                                                }
+                                            }
+                                        }
+                            }
+                            Err(e) => { imported.push(format!("FAILED:{}: {}", url, e)); }
+                        }
+                    }
+                    Err(e) => { imported.push(format!("FAILED:{}: {}", url, e)); }
+                }
+            }
+            depth += 1;
+        }
+
+        serde_json::json!({
+            "ok": true,
+            "imported": imported,
+            "total": imported.len(),
+            "depth": depth,
+        }).to_string()
+    }
+
+    // ── Marketplace ────────────────────────────────────────────────────────
+
+    #[tool(name = "onto_marketplace", description = "Browse and install ontologies from the curated catalogue of 33 W3C/ISO/industry standards plus the open community-pack registry (community/registry.json, fetched at runtime; override with OPEN_ONTOLOGIES_COMMUNITY_REGISTRY). Actions: 'list' (browse both tiers, optional domain filter; community=false for curated only) or 'install' (fetch and load by ID — curated IDs win over community)")]
+    async fn onto_marketplace(&self, Parameters(input): Parameters<OntoMarketplaceInput>) -> String {
+        use crate::marketplace;
+        match input.action.as_str() {
+            "list" => {
+                let entries = marketplace::list(input.domain.as_deref());
+                let mut items: Vec<serde_json::Value> = entries.iter().map(|e| {
+                    serde_json::json!({
+                        "id": e.id,
+                        "name": e.name,
+                        "description": e.description,
+                        "domain": e.domain,
+                        "url": e.url,
+                        "format": marketplace::format_name(e.format),
+                        "source": "curated",
+                    })
+                }).collect();
+                let mut community_error = None;
+                let mut registry_source = None;
+                if input.community.unwrap_or(true) {
+                    match marketplace::load_community_packs().await {
+                        Ok((packs, shadowed, source)) => {
+                            registry_source = Some(source);
+                            for p in packs.iter().filter(|p| {
+                                input.domain.as_deref().is_none_or(|d| p.domain == d)
+                            }) {
+                                items.push(serde_json::json!({
+                                    "id": p.id,
+                                    "name": p.name,
+                                    "description": p.description,
+                                    "domain": p.domain,
+                                    "url": p.url,
+                                    "format": p.format,
+                                    "source": "community",
+                                    "maintainer": p.maintainer,
+                                    "license": p.license,
+                                }));
+                            }
+                            if !shadowed.is_empty() {
+                                community_error = Some(format!(
+                                    "community packs shadowing curated ids were ignored: {}",
+                                    shadowed.join(", ")
+                                ));
+                            }
+                        }
+                        Err(e) => community_error = Some(e),
+                    }
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "count": items.len(),
+                    "ontologies": items,
+                    "community_registry": registry_source,
+                    "community_registry_error": community_error,
+                }).to_string()
+            }
+            "install" => {
+                let id = match input.id.as_deref() {
+                    Some(id) => id,
+                    None => return r#"{"error":"'id' is required for install action"}"#.to_string(),
+                };
+                // Curated first; community packs can never shadow a curated ID.
+                let (name, url, format, tier, license) = match marketplace::find(id) {
+                    Some(e) => (e.name.to_string(), e.url.to_string(), e.format, "curated", None),
+                    None => match marketplace::load_community_packs().await {
+                        Ok((packs, _, _)) => match packs.into_iter().find(|p| p.id == id) {
+                            Some(p) => {
+                                let format = match marketplace::parse_format(&p.format) {
+                                    Some(f) => f,
+                                    None => return serde_json::json!({
+                                        "error": format!("community pack '{}' has invalid format '{}'", id, p.format),
+                                    }).to_string(),
+                                };
+                                (p.name, p.url, format, "community", p.license)
+                            }
+                            None => {
+                                let available: Vec<&str> = marketplace::CATALOGUE.iter().map(|e| e.id).collect();
+                                return serde_json::json!({
+                                    "error": format!("Unknown ontology ID: '{}'. Use action 'list' to see curated and community IDs.", id),
+                                    "available_curated": available,
+                                }).to_string();
+                            }
+                        },
+                        Err(e) => {
+                            let available: Vec<&str> = marketplace::CATALOGUE.iter().map(|e| e.id).collect();
+                            return serde_json::json!({
+                                "error": format!("'{}' is not a curated ID and the community registry could not be loaded: {}", id, e),
+                                "available_curated": available,
+                            }).to_string();
+                        }
+                    },
+                };
+                match crate::graph::GraphStore::fetch_url(&url).await {
+                    Ok(content) => {
+                        match self.graph.load_content_with_base(&content, format, Some(&url)) {
+                            Ok(count) => {
+                                let stats = self.graph.get_stats().unwrap_or_default();
+                                let stats_val: serde_json::Value = serde_json::from_str(&stats).unwrap_or_default();
+                                serde_json::json!({
+                                    "ok": true,
+                                    "installed": id,
+                                    "name": name,
+                                    "tier": tier,
+                                    "license": license,
+                                    "triples_loaded": count,
+                                    "source": url,
+                                    "classes": stats_val["classes"],
+                                    "properties": stats_val["properties"],
+                                    "individuals": stats_val["individuals"],
+                                }).to_string()
+                            }
+                            Err(e) => Self::err_json(format!("Parse error for {}: {}", id, e)),
+                        }
+                    }
+                    Err(e) => Self::err_json(format!("Fetch error for {}: {}", id, e)),
+                }
+            }
+            other => Self::err_json(format!("Unknown action '{}'. Use 'list' or 'install'.", other)),
+        }
+    }
+
+    // ── WASM plugins ───────────────────────────────────────────────────────
+
+    #[tool(name = "onto_plugin_list", description = "Discover installed WASM plugins and the tools they provide. Plugins are community .wasm modules in ~/.open-ontologies/plugins or ./plugins (override with OPEN_ONTOLOGIES_PLUGIN_DIRS), run in-process with fuel metering. Requires a build with --features plugins.")]
+    fn onto_plugin_list(&self) -> String {
+        #[cfg(not(feature = "plugins"))]
+        { r#"{"error":"Compiled without plugins feature. Rebuild with --features plugins"}"#.to_string() }
+        #[cfg(feature = "plugins")]
+        {
+        let (plugins, errors) = crate::plugins::discover();
+        let items: Vec<serde_json::Value> = plugins.iter().map(|p| {
+            serde_json::json!({
+                "name": p.manifest.name,
+                "version": p.manifest.version,
+                "path": p.path.display().to_string(),
+                "tools": p.manifest.tools.iter().map(|t| serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                })).collect::<Vec<_>>(),
+            })
+        }).collect();
+        serde_json::json!({
+            "ok": true,
+            "count": items.len(),
+            "plugins": items,
+            "search_dirs": crate::plugins::plugin_dirs().iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+            "broken": errors,
+        }).to_string()
+        }
+    }
+
+    #[tool(name = "onto_plugin_call", description = "Invoke a tool on an installed WASM plugin. Plugins are pure JSON->JSON transforms with no direct store access; pass 'sparql' to run a SELECT against the loaded store and inject its result rows into the plugin input as 'bindings'. Requires a build with --features plugins.")]
+    async fn onto_plugin_call(&self, Parameters(input): Parameters<OntoPluginCallInput>) -> String {
+        #[cfg(not(feature = "plugins"))]
+        { let _ = input; return r#"{"error":"Compiled without plugins feature. Rebuild with --features plugins"}"#.to_string(); }
+        #[cfg(feature = "plugins")]
+        {
+        let plugin = match crate::plugins::find(&input.plugin) {
+            Ok(p) => p,
+            Err(e) => return serde_json::json!({"error": e}).to_string(),
+        };
+        let mut payload = serde_json::json!({
+            "tool": input.tool,
+            "input": input.input.unwrap_or(serde_json::Value::Null),
+        });
+        if let Some(sparql) = input.sparql.as_deref() {
+            if let Err(e) = self.registry.ensure_loaded() {
+                return Self::err_json(format!("ensure_loaded: {e}"));
+            }
+            match self.graph.sparql_select(sparql) {
+                Ok(json) => {
+                    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                    payload["bindings"] = parsed.get("results").cloned().unwrap_or(serde_json::Value::Null);
+                }
+                Err(e) => return serde_json::json!({"error": format!("sparql failed: {e}")}).to_string(),
+            }
+        }
+        match crate::plugins::call(&plugin.path, &payload) {
+            Ok(result) => serde_json::json!({
+                "ok": true,
+                "plugin": plugin.manifest.name,
+                "tool": input.tool,
+                "result": result,
+            }).to_string(),
+            Err(e) => serde_json::json!({"error": e, "plugin": plugin.manifest.name}).to_string(),
+        }
+        }
+    }
+
+    #[tool(name = "onto_version", description = "Save a named snapshot of the current ontology store")]
+    async fn onto_version(&self, Parameters(input): Parameters<OntoVersionInput>) -> String {
+        use crate::ontology::OntologyService;
+        OntologyService::save_version(&self.db, &self.graph, &input.label)
+            .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_history", description = "List all saved ontology version snapshots")]
+    fn onto_history(&self) -> String {
+        use crate::ontology::OntologyService;
+        OntologyService::list_versions(&self.db)
+            .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_rollback", description = "Restore the ontology store to a previously saved version")]
+    async fn onto_rollback(&self, Parameters(input): Parameters<OntoRollbackInput>) -> String {
+        use crate::ontology::OntologyService;
+        OntologyService::rollback_version(&self.db, &self.graph, &input.label)
+            .unwrap_or_else(Self::err_json)
+    }
+
+    // ── Data ingestion & reasoning ─────────────────────────────────────────
+
+    #[tool(name = "onto_ingest", description = "Parse a structured data file (CSV, JSON, NDJSON, XML, YAML, XLSX, Parquet) into RDF triples and load into the ontology store. Optionally uses a mapping config to control field-to-predicate mapping.")]
+    async fn onto_ingest(&self, Parameters(input): Parameters<OntoIngestInput>) -> String {
+        use crate::ingest::DataIngester;
+        use crate::mapping::MappingConfig;
+
+        let base_iri = input.base_iri.as_deref().unwrap_or("http://example.org/data/");
+
+        // Parse data file
+        let rows = match DataIngester::parse_file_with_format(&input.path, input.format.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(format!("Failed to parse {}: {}", input.path, e)),
+        };
+
+        if rows.is_empty() {
+            return r#"{"ok":true,"triples_loaded":0,"warnings":["No data rows found"]}"#.to_string();
+        }
+
+        // Get or generate mapping
+        let mapping = if let Some(ref mapping_str) = input.mapping {
+            if input.inline_mapping.unwrap_or(false) {
+                match serde_json::from_str::<MappingConfig>(mapping_str) {
+                    Ok(m) => m,
+                    Err(e) => return Self::err_json(format!("Invalid mapping JSON: {}", e)),
+                }
+            } else {
+                match std::fs::read_to_string(mapping_str) {
+                    Ok(content) => match serde_json::from_str::<MappingConfig>(&content) {
+                        Ok(m) => m,
+                        Err(e) => return Self::err_json(format!("Invalid mapping file: {}", e)),
+                    },
+                    Err(e) => return Self::err_json(format!("Cannot read mapping file: {}", e)),
+                }
+            }
+        } else {
+            let headers = DataIngester::extract_headers(&rows);
+            MappingConfig::from_headers(&headers, base_iri, &format!("{}Thing", base_iri))
+        };
+
+        // Convert to N-Triples and load
+        let mut ntriples = mapping.rows_to_ntriples(&rows);
+
+        // PROV-O: where did each of these subjects come from. Every fact
+        // carrying its source is what makes a graph auditable later, and it
+        // is the interop shape other platforms expect.
+        let mut prov_triples = 0usize;
+        if input.provenance.unwrap_or(false) {
+            if !ntriples.is_empty() && !ntriples.ends_with('\n') {
+                ntriples.push('\n');
+            }
+            const PROV_DERIVED: &str = "<http://www.w3.org/ns/prov#wasDerivedFrom>";
+            let source_iri = format!("{}source/{}", base_iri,
+                std::path::Path::new(&input.path)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or("data")
+                    .replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-' && c != '_', "_"));
+            let mut extra = String::new();
+            extra.push_str(&format!(
+                "<{source_iri}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/prov#Entity> .\n"));
+            extra.push_str(&format!(
+                "<{source_iri}> <http://www.w3.org/2000/01/rdf-schema#label> {} .\n",
+                serde_json::to_string(&input.path).unwrap_or_else(|_| "\"source\"".into())));
+            extra.push_str(&format!(
+                "<{source_iri}> <http://www.w3.org/ns/prov#generatedAtTime> \"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n",
+                chrono::Utc::now().to_rfc3339()));
+            let mut seen = std::collections::HashSet::new();
+            for line in ntriples.lines() {
+                if let Some(subject) = line
+                    .split_whitespace()
+                    .next()
+                    .filter(|s| s.starts_with('<') && seen.insert(s.to_string()))
+                {
+                    extra.push_str(&format!("{subject} {PROV_DERIVED} <{source_iri}> .\n"));
+                }
+            }
+            prov_triples = extra.lines().count();
+            ntriples.push_str(&extra);
+        }
+
+        match self.graph.load_ntriples(&ntriples) {
+            Ok(count) => {
+                serde_json::json!({
+                    "ok": true,
+                    "triples_loaded": count,
+                    "rows_processed": rows.len(),
+                    "mapping_fields": mapping.mappings.len(),
+                    "provenance_triples": prov_triples,
+                }).to_string()
+            }
+            Err(e) => Self::err_json(format!("Failed to load triples: {}", e)),
+        }
+    }
+
+    #[tool(name = "onto_induce", description = "ONE SHEET IN, ONE ONTOLOGY OUT, WITH THE EVIDENCE FOR EVERY LINE. Reads one data sheet (CSV, JSON, NDJSON, XML, YAML, XLSX, Parquet) and induces an OWL class with typed properties, a SHACL shape the rows satisfy by construction, and a mapping that loads the rows as instances; then loads all three unless load=false. WHAT IS DECIDED, AND FROM WHAT: the identifier is the first column if it is filled and unique in every row, else an id-like column that is, else a row number (and the report says which); each property's xsd datatype is the narrowest every value parses as (boolean, integer, decimal, date, dateTime, anyURI, string); a column whose every value is an identifier of a row becomes an object property ranging over the class; numbered columns (topping1..topping7) become ONE multi-valued property with sh:maxCount = the group size; a string column with two to twelve distinct values, each seen five times over on average, becomes an sh:in enumeration. Every induced statement carries a sentence of evidence (rows filled, distinct values, values per row, the parse) in rdfs:comment or sh:description. THREE DELIBERATE CHOICES, STATED: cardinality is a SHAPE and never owl:FunctionalProperty (under OWL RL a functional property with two values identifies the objects, prp-fp, instead of rejecting the row); observed numeric ranges are reported and never made sh:minInclusive/sh:maxInclusive; a numbered group is reported so a false merge is visible. WHAT THIS IS: a HYPOTHESIS about the sheet, not a truth about the domain, and the `means` field says so; a clean validation of this sheet against its own induced shapes says nothing, the shapes constrain the NEXT row. Returns class, columns with their profiles and evidence, ontology_ttl, shapes_ttl, mapping, and what was loaded.")]
+    async fn onto_induce(&self, Parameters(input): Parameters<OntoInduceInput>) -> String {
+        use crate::ingest::DataIngester;
+        let base_iri = input.base_iri.clone().unwrap_or_else(|| "http://example.org/data/".to_string());
+        let source_stem = std::path::Path::new(&input.path).file_stem()
+            .and_then(|s| s.to_str()).unwrap_or("Row").to_string();
+        let stem = input.class_name.clone().unwrap_or_else(|| source_stem.clone());
+        let rows = match DataIngester::parse_file(&input.path) {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(format!("Failed to parse {}: {}", input.path, e)),
+        };
+        if rows.is_empty() {
+            return Self::err_json("no data rows found; nothing to induce from");
+        }
+        let headers = DataIngester::headers_in_order(&input.path, &rows);
+        let induced = crate::induce::induce_with_source(&rows, &headers, &stem, &source_stem, &base_iri);
+        let mut v = match serde_json::to_value(&induced) {
+            Ok(v) => v,
+            Err(e) => return Self::err_json(e),
+        };
+        if input.load.unwrap_or(true) {
+            let loaded = self
+                .graph
+                .load_turtle(&induced.ontology_ttl, None)
+                .and_then(|a| self.graph.load_turtle(&induced.shapes_ttl, None).map(|b| a + b))
+                .and_then(|ab| self.graph.load_ntriples(&induced.instance_ntriples(&rows)).map(|c| (ab, c)));
+            match loaded {
+                Ok((schema, data)) => {
+                    v["loaded"] = serde_json::json!({"schema_triples": schema, "instance_triples": data});
+                    self.lineage().record(&self.session_id, "IN", "induce", &format!("{} rows -> {}", rows.len(), induced.class));
+                }
+                Err(e) => return Self::err_json(format!("induced, but loading failed: {e}")),
+            }
+        }
+        v["ok"] = serde_json::json!(true);
+        v.to_string()
+    }
+
+    #[tool(name = "onto_temporal_snapshot", description = "Which named graphs are in scope at a point in time, and which are excluded and why. Two independent clocks: valid_at asks what was TRUE then, as_of asks what was KNOWN then. Assertions live in named graphs described in the default graph with temporal:validFrom, validTo, recordedAt and recordedUntil; a graph with no description is timeless and always in scope. Both intervals are half-open, so an assertion whose recordedUntil has passed is excluded as no longer believed instead of being carried forward beside the correction that replaced it. Bounds on all four axes are read as instants on the UTC timeline from xsd:date, xsd:dateTime, xsd:gYearMonth or xsd:gYear; a less precise bound names the FIRST instant of its period, and a value with no timezone offset is UTC. A bound matching none of those, or two different instants on one axis, makes the graph INVALID: reported in `invalid` with a reason, never in scope and never timeless. A graph whose validFrom and validTo both read but together hold at no instant (the same instant twice, or validTo before validFrom) is not invalid: it is excluded at every instant asked about, with a reason naming which of the two it is; with no valid_at it is in scope like any other graph. The scans are capped: `complete` says whether they finished, and a run that was cut short also carries `truncated` and a `warning`, because a truncated validity scan makes this partition wrong rather than merely short. Lineage is asserted, never inferred: temporal:supersedes on the NEWER graph names the graph it replaces, and where the replaced graph carries no recordedUntil its closing bound is derived from the successor's recordedAt (the earliest, where there are several), so an excluded row closed that way carries `superseded_by`; an explicit recordedUntil always governs and a disagreement with the successor is reported, not reconciled. temporal:retracts names a graph withdrawn without replacement: from the retraction's recordedAt the retracted graph leaves in_scope and is listed under `retracted` with the retracting graph and instant; with no as_of the recorded axis is not consulted, for a retraction no more than for a recordedUntil, and the graph takes the ordinary path. `lineage`, present only when non-empty, reports what the links could not settle: a disagreement, a transaction interval that closes before it opens (a successor recorded before its predecessor, reported as inverted and believed at no instant, never clamped), an undated successor or retractor, more than one successor, a cycle, or a link that names nothing readable or is asserted by a graph whose own description could not be read.")]
+    async fn onto_temporal_snapshot(&self, Parameters(input): Parameters<OntoTemporalSnapshotInput>) -> String {
+        use crate::temporal::Temporal;
+        match Temporal::new(self.graph.clone()).snapshot(input.valid_at.as_deref(), input.as_of.as_deref()) {
+            Ok(json) => json,
+            // Renders the error by quote substitution only, with no JSON
+            // escaping, so a message on this path must never echo caller
+            // text: a backslash or a newline would break the JSON. That is
+            // why `temporal::argument` (the wrapper over `instant::argument`)
+            // does not quote the argument in its message.
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_temporal_query", description = "Run a SPARQL graph pattern against only the graphs in temporal scope: what the graph said at a given valid time, as known at a given recorded time. Pass the body of a WHERE clause as `pattern`. valid_at and as_of are read as instants on the UTC timeline (xsd:date, xsd:dateTime, xsd:gYearMonth or xsd:gYear; no offset means UTC) and an unreadable one is refused rather than ignored. Graphs whose own bounds could not be read are out of scope and listed in `invalid`. A graph whose bounds read but hold at no instant (validFrom and validTo the same instant, or validTo before validFrom) is out of scope at any valid_at, as at every other instant, and onto_temporal_snapshot at that instant reports it under `excluded` with a reason naming which; with no valid_at it is read like any other graph, since no instant was asked about. `complete` is false when the result list was cut at its cap or when the scope it ran over was, and `truncated` says which; only the second case is a wrong answer, and it carries a `warning`. The scope honours asserted lineage: a graph whose closing bound was derived from the recordedAt of the graph that temporal:supersedes it is out of scope from that instant, and a graph a temporal:retracts link has withdrawn by as_of is not read and is listed under `retracted` (with no as_of the recorded axis is not consulted, for a retraction no more than for a recordedUntil, and the graph is read like any other); `lineage` carries what the links could not settle, both keys present only when non-empty.")]
+    async fn onto_temporal_query(&self, Parameters(input): Parameters<OntoTemporalQueryInput>) -> String {
+        use crate::temporal::Temporal;
+        match Temporal::new(self.graph.clone()).query_at(
+            &input.pattern, input.valid_at.as_deref(), input.as_of.as_deref(),
+        ) {
+            Ok(json) => json,
+            // Renders the error by quote substitution only, with no JSON
+            // escaping, so a message on this path must never echo caller
+            // text: a backslash or a newline would break the JSON. That is
+            // why `temporal::argument` (the wrapper over `instant::argument`)
+            // does not quote the argument in its message.
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_temporal_conflicts", description = "Disjointness violations that claim OVERLAPPING validity, separated from those that do not. Without valid time a correction reads as a contradiction: an entity recorded one way until May and another after trips every check. This reports genuine disagreement about the same period as contradictions, and everything else as non_overlapping: pairs with no instant in common, judged on their bounds read as instants on the UTC timeline, so a timezone offset is honoured. That is all that is checked -- it is not evidence that one assertion replaced another, and the bucket also holds pairs separated by a GAP, which is missing coverage rather than history, and pairs where one period holds at no instant (empty or inverted), which onto_temporal_snapshot reports once with a reason naming which. The `superseded` key carries the same set under a name that claimed more than was proven; it is deprecated and will be dropped at 2.0. A pair whose graph has temporal metadata that could not be read is in neither bucket: it goes to `undecided`, because an unreadable period is not an open one and treating it as timeless would make it overlap everything. The scans are capped: `complete` says whether they finished, and if the validity scan was cut a `warning` marks the classification unsound, because a pair compared without its periods can appear here as a contradiction when it is a correction. A pair where one graph asserts that it temporal:supersedes the other, directly or through a chain of supersedes links, lands in `corrections` (with `corrections_count`, present only when non-empty) before the overlap test is reached: lineage that is asserted and never inferred, and such a pair is never a contradiction whatever its periods. A pair one side of which a temporal:retracts link has withdrawn lands in `retracted` (with `retracted_count`, present only when non-empty), checked before corrections in the order onto_temporal_snapshot uses, and each row names the withdrawn side, the graph that retracts it and its recordedAt. This tool takes no as_of, so retracted here means a retraction is RECORDED, whenever it was: one recorded after every period in the store withdraws, and an undated retractor withdraws full stop. That is not the snapshot's question, where a retraction stands only from its recordedAt on, and the note says so next to the count.")]
+    async fn onto_temporal_conflicts(&self) -> String {
+        use crate::temporal::Temporal;
+        match Temporal::new(self.graph.clone()).conflicts() {
+            Ok(json) => json,
+            // Renders the error by quote substitution only, with no JSON
+            // escaping, so a message on this path must never echo caller
+            // text: a backslash or a newline would break the JSON. This
+            // handler takes no argument, so nothing caller-supplied reaches
+            // it today; the rule is stated so an argument added later
+            // inherits it.
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_reason_incremental", description = "Derive the consequences of newly added triples WITHOUT recomputing the whole closure. Pass the added triples as N-Triples in `delta`; the engine joins them against the existing closure (semi-naive evaluation), so the work is proportional to what changed rather than to the size of the store. Use after adding facts to an already-materialised graph. Adding SCHEMA axioms (subClassOf, domain, range, inverseOf, equivalentClass) changes what the whole store entails and is refused with an explanation: run onto_reason for those. This path has NO snapshot form: it reads the union of every graph and materialises into the default graph, so over a store that describes its named graphs with the temporal vocabulary (https://open-ontologies.org/temporal#) it is REFUSED unless `all_versions: true` says the union of every version is what you meant. Use onto_reason with valid_at / as_of for a snapshot.")]
+    async fn onto_reason_incremental(&self, Parameters(input): Parameters<OntoReasonIncrementalInput>) -> String {
+        use crate::reason_incremental::{parse_ntriples, IncrementalReasoner};
+        let delta = parse_ntriples(&input.delta);
+        if delta.is_empty() {
+            return r#"{"error":"delta parsed to no triples: expected N-Triples"}"#.to_string();
+        }
+        match IncrementalReasoner::run_scoped(
+            &self.graph,
+            &delta,
+            input.materialize.unwrap_or(true),
+            input.all_versions.unwrap_or(false),
+        ) {
+            Ok(json) => json,
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_support_check", description = "Check whether the graph's claims are backed by the sources they cite. Returns which claims cite NO source at all (computed, no model needed) and, for those that do, verification TASKS: the claim as a sentence, the source, and what to decide. Read each source and record supported/refuted/unrelated with onto_support_verdict. Complements onto_vocab_check: conformance asks whether a claim is expressible, support asks whether it is true to its source, and a claim can fail either independently.")]
+    async fn onto_support_check(&self, Parameters(input): Parameters<OntoSupportCheckInput>) -> String {
+        use crate::support::SupportChecker;
+        let checker = SupportChecker::new(self.graph.clone(), self.db.clone());
+        match checker.check(input.prov_predicate.as_deref(), input.limit.unwrap_or(25)) {
+            Ok(json) => json,
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_support_verdict", description = "Record whether a cited source supports a claim: supported, refuted, or unrelated. Verdicts persist, so onto_support_check skips what has already been judged and onto_support_report can summarise.")]
+    async fn onto_support_verdict(&self, Parameters(input): Parameters<OntoSupportVerdictInput>) -> String {
+        use crate::support::SupportChecker;
+        let checker = SupportChecker::new(self.graph.clone(), self.db.clone());
+        match checker.record_verdict(&input.claim_id, &input.verdict, input.note.as_deref()) {
+            Ok(json) => json,
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_support_report", description = "Summarise provenance quality: the unsourced-claim rate over the whole graph, and the support rate across the claims judged so far.")]
+    async fn onto_support_report(&self, Parameters(input): Parameters<OntoSupportReportInput>) -> String {
+        use crate::support::SupportChecker;
+        let checker = SupportChecker::new(self.graph.clone(), self.db.clone());
+        match checker.report(input.prov_predicate.as_deref()) {
+            Ok(json) => json,
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_pack", description = "Write the loaded graph, its verification evidence and, optionally, its derivation certificate to a portable, versioned pack: sorted N-Triples plus a manifest (name, version, counts, timestamp, sha256, the lint/enforce results recorded at pack time, and a content_sha256 covering the graph AND the certificate together). Pass certificate_dir to carry the proof: the evidence is what this engine SAID, the certificate is what the receiver's own Lean checker can re-derive. A certificate resting on assertions the packed graph does not contain is refused here rather than at the auditor's end.")]
+    async fn onto_pack(&self, Parameters(input): Parameters<OntoPackInput>) -> String {
+        use crate::pack::Packer;
+        let name = input.name.unwrap_or_else(|| {
+            std::path::Path::new(&input.path)
+                .file_stem().and_then(|s| s.to_str()).unwrap_or("pack").to_string()
+        });
+        // Evidence is gathered here, at pack time, so the artifact records
+        // what the graph passed rather than asking the receiver to trust it.
+        let evidence = if input.include_evidence.unwrap_or(true) {
+            let lint = self.graph.serialize("turtle").ok()
+                .and_then(|ttl| crate::ontology::OntologyService::lint(&ttl).ok());
+            let enforce = crate::enforce::Enforcer::new(self.db.clone(), self.graph.clone())
+                .enforce("generic").ok();
+            Some(serde_json::json!({
+                "lint": lint.and_then(|l| serde_json::from_str::<serde_json::Value>(l.as_str()).ok()),
+                "enforce_generic": enforce.and_then(|e| serde_json::from_str::<serde_json::Value>(e.as_str()).ok()),
+            }))
+        } else {
+            None
+        };
+        let version = input.version.unwrap_or_else(|| "1.0.0".into());
+        let cert_dir = input.certificate_dir.as_deref().map(std::path::Path::new);
+        match Packer::new(self.graph.clone()).pack(&crate::pack::PackRequest {
+            path: &input.path,
+            name: &name,
+            version: &version,
+            evidence,
+            certificate_dir: cert_dir,
+            profile_claimed: input.profile.as_deref(),
+        }) {
+            Ok(json) => json,
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_unpack", description = "Load a pack written by onto_pack, refusing it if either digest does not match, and re-run THIS machine's Lean checker over the certificate the pack carries. Four answers are kept apart: the pack carries no certificate; the certificate was accepted; it was REFUSED, which blocks the load unless load_even_if_refused is passed; or this build has no checker, so nothing was checked, which is not a pass. An acceptance proves the materialised triples follow from the asserted ones under the rules that ran; it proves nothing about whether the asserted triples are true.")]
+    async fn onto_unpack(&self, Parameters(input): Parameters<OntoUnpackInput>) -> String {
+        use crate::pack::Packer;
+        let opts = crate::pack::UnpackOptions {
+            verify_only: input.verify_only.unwrap_or(false),
+            check_certificate: input.check_certificate.unwrap_or(true),
+            checker: input.checker.map(std::path::PathBuf::from),
+            certificate_out_dir: input.certificate_out_dir.map(std::path::PathBuf::from),
+            load_even_if_refused: input.load_even_if_refused.unwrap_or(false),
+        };
+        match Packer::new(self.graph.clone()).unpack(&input.path, &opts) {
+            Ok(json) => json,
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_communities", description = "Detect communities in the loaded entity graph and return a SKELETON per community: size, top members by degree, internal relations, and the bridges connecting it to other communities. Deterministic label propagation, no model involved. Use the skeletons to write one report per community, then answer corpus-wide questions (themes, overview, what is this corpus about) by reasoning over the reports instead of traversing from an anchor entity.")]
+    async fn onto_communities(&self, Parameters(input): Parameters<OntoCommunitiesInput>) -> String {
+        use crate::communities::Communities;
+        let detector = Communities::new(self.graph.clone());
+        match detector.detect(input.min_size.unwrap_or(3), input.top_members.unwrap_or(8)) {
+            Ok(json) => json,
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_map", description = "Generate a mapping config by inspecting a data file's schema against the currently loaded ontology. Returns a JSON mapping that can be reviewed and passed to onto_ingest.")]
+    async fn onto_map(&self, Parameters(input): Parameters<OntoMapInput>) -> String {
+        use crate::ingest::DataIngester;
+        use crate::mapping::MappingConfig;
+
+        let rows = match DataIngester::parse_file_with_format(&input.data_path, input.format.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(format!("Failed to parse {}: {}", input.data_path, e)),
+        };
+        let headers = DataIngester::extract_headers(&rows);
+
+        // Get ontology classes and properties from the store
+        let classes_query = r#"SELECT DISTINCT ?c WHERE {
+            { ?c a <http://www.w3.org/2002/07/owl#Class> }
+            UNION
+            { ?c a <http://www.w3.org/2000/01/rdf-schema#Class> }
+        }"#;
+        let props_query = r#"SELECT DISTINCT ?p WHERE {
+            { ?p a <http://www.w3.org/2002/07/owl#ObjectProperty> }
+            UNION
+            { ?p a <http://www.w3.org/2002/07/owl#DatatypeProperty> }
+            UNION
+            { ?p a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> }
+        }"#;
+
+        let classes = self.graph.sparql_select_union(classes_query).unwrap_or_default();
+        let props = self.graph.sparql_select_union(props_query).unwrap_or_default();
+
+        let extract_iris = |json: &str, var: &str| -> Vec<String> {
+            serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|v| v["results"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|r| r[var].as_str().map(|s| s.trim_matches(|c| c == '<' || c == '>').to_string()))
+                .collect()
+        };
+
+        let class_iris = extract_iris(&classes, "c");
+        let prop_iris = extract_iris(&props, "p");
+
+        let mapping = MappingConfig::from_headers(
+            &headers,
+            "http://example.org/data/",
+            class_iris.first().map(|s| s.as_str()).unwrap_or("http://example.org/Thing"),
+        );
+
+        let result = serde_json::json!({
+            "mapping": mapping,
+            "data_fields": headers,
+            "ontology_classes": class_iris,
+            "ontology_properties": prop_iris,
+        });
+
+        if let Some(ref save_path) = input.save_path
+            && let Ok(json) = serde_json::to_string_pretty(&mapping)
+                && let Err(e) = std::fs::write(save_path, &json) {
+                    return Self::err_json(format!("Cannot write mapping file: {}", e));
+                }
+
+        result.to_string()
+    }
+
+    #[tool(name = "onto_shacl", description = "Validate the loaded ontology data against SHACL shapes. Checks the core constraint components written under `sh:property`, including `sh:minCount`, `sh:maxCount`, `sh:datatype`, `sh:class`, `sh:nodeKind`, `sh:pattern`, `sh:in`, `sh:hasValue`, `sh:or` and `sh:not`, plus `sh:sparql`. A constraint it cannot execute is listed in `skipped_constraints` and the verdict is null rather than true; that includes a count or length bound that is not a non-negative integer (`sh:minCount \"one\"`, `sh:maxCount -1`), which is never read as 0 or as unbounded. An entry there is one CONSTRAINT-EVALUATION SITE and not one shape: a single `sh:property` block carrying both `sh:minCount` and `sh:node` can produce a violation from the first and a skip entry from the second, so the SAME shape can appear in `violations` and in `skipped_constraints` at once and that is not a contradiction. Every entry names the `shape` it was written on and the `constraint` predicate that was not evaluated, which is what separates a constraint that did not run from one that ran and selected nothing. Returns a conformance report with violations, `focus_nodes` and `unmatched_shapes`, plus `scope`, which names the graphs the run READ. By default every graph in the store is read. Over a store that describes its named graphs with the temporal vocabulary (https://open-ontologies.org/temporal#) that union is a state that held at no instant, so a run with no instant named is REFUSED rather than answered: pass `valid_at` (what was TRUE then), `as_of` (what was KNOWN then) or `all_versions: true` to say the union is what you meant. A scoped run evaluates every data-side query, `sh:sparql` included, against the in-scope named graphs plus the default graph and nothing else. A snapshot that selects no graph returns `conforms: null` with its own reason rather than conforming vacuously. Class and property DECLARATION lookups are never scoped: a declaration is context-free and has the same answer at every instant. `report_format: \"turtle\"` or `\"ntriples\"` returns a W3C sh:ValidationReport graph instead of JSON; an undetermined run is written sh:conforms false plus oo:undetermined true, never sh:conforms true.")]
+    async fn onto_shacl(&self, Parameters(input): Parameters<OntoShaclInput>) -> String {
+        use crate::shacl::ShaclValidator;
+        let shapes = if input.inline.unwrap_or(false) {
+            input.shapes.clone()
+        } else {
+            match std::fs::read_to_string(&input.shapes) {
+                Ok(c) => c,
+                Err(e) => return Self::err_json(format!("Cannot read shapes file: {}", e)),
+            }
+        };
+        let format = match crate::shacl_report::ReportFormat::parse(input.report_format.as_deref()) {
+            Ok(f) => f,
+            Err(e) => return Self::err_json(e),
+        };
+        if input.verified.unwrap_or(false) {
+            if format != crate::shacl_report::ReportFormat::Json {
+                return Self::err_json(
+                    "verified: true cannot be combined with a report_format other than json. \
+                     The verified evaluator returns its own report structure, which the \
+                     sh:ValidationReport writer does not read, so the format would be silently \
+                     dropped."
+                        .to_string(),
+                );
+            }
+            // Refused rather than ignored. The verified evaluator reads one
+            // N-Triples dump of the store and has no notion of a temporal
+            // scope, so honouring the argument is impossible and dropping it
+            // would answer a different question from the one that was asked.
+            if input.valid_at.is_some()
+                || input.as_of.is_some()
+                || input.all_versions.unwrap_or(false)
+            {
+                return Self::err_json(
+                    "verified: true cannot be combined with valid_at, as_of or all_versions.                      The verified evaluator reads the whole store and has no temporal scope,                      so the scope would be silently dropped. Run the scoped question on the                      default path, or the verified question without a scope."
+                        .to_string(),
+                );
+            }
+            return match crate::shacl_verified::validate_verified(&self.graph, &shapes) {
+                Ok(v) => v.to_string(),
+                Err(e) => Self::err_json(e.to_string()),
+            };
+        }
+        let request = match crate::temporal::ScopeRequest::from_args(
+            input.valid_at.as_deref(),
+            input.as_of.as_deref(),
+            input.all_versions.unwrap_or(false),
+        ) {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(e),
+        };
+        ShaclValidator::report_scoped(&self.graph, &shapes, &request)
+            .and_then(|report| report.render(format))
+            .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_ossie_import", description = "Compile an Apache Ossie (incubating, formerly Open Semantic Interchange) ontology document into OWL 2 DL + SHACL, and optionally load it into the active store so every other tool here works on it. Ossie is the vendor-neutral semantic-model spec backed by Snowflake, Salesforce, Databricks, dbt Labs and ~50 other platforms; its ontology module is a fact-based conceptual model (EntityType/ValueType concepts, roles, multiplicities, verbalizations, identifiers, derivation rules) that references neither RDF, OWL, SKOS nor SHACL. That means an Ossie ontology is invisible to every reasoner and validator in the semantic web stack until it is compiled. This tool does the compile: concepts become owl:Class / rdfs:Datatype, binary relationships become object/datatype properties, `identify_by` becomes owl:hasKey, unary relationships become subclasses, arity>=3 relationships are reified (W3C n-ary pattern 1), and the recognised `requires` fragment becomes XSD facets mirrored into SHACL. FOUR Ossie constructs have no OWL 2 DL expression and are carried by SHACL or by annotation instead: OneToOne onto a ValueType (that is InverseFunctionalDataProperty, forbidden in OWL 2 DL — and it is the COMMON case, since a preferred identifier is by construction a relationship to a value type), ManyToOne on arity>=3 (a tuple functional dependency), `derived_by` (a recursive rule language) and `requires` beyond scalar comparison. Every one of these is reported in `issues` and preserved verbatim as an ossie: annotation, so nothing is silently dropped. After `load=true`, run onto_reason / onto_dl_explain / onto_shacl / onto_query against a semantic model that previously had no formal semantics at all.")]
+    async fn onto_ossie_import(&self, Parameters(input): Parameters<OntoOssieImportInput>) -> String {
+        use crate::ossie;
+
+        let source = if input.inline.unwrap_or(false) {
+            input.source.clone()
+        } else {
+            match std::fs::read_to_string(&input.source) {
+                Ok(content) => content,
+                Err(e) => {
+                    return serde_json::json!({
+                        "error": format!("cannot read Ossie ontology document: {e}")
+                    })
+                    .to_string()
+                }
+            }
+        };
+
+        let document = match ossie::parse_document(&source) {
+            Ok(document) => document,
+            Err(e) => return serde_json::json!({ "error": e }).to_string(),
+        };
+
+        let conversion = match ossie::to_owl_shacl(
+            &document,
+            input.base_iri.as_deref(),
+            input.emit_shacl.unwrap_or(true),
+        ) {
+            Ok(conversion) => conversion,
+            Err(e) => return serde_json::json!({ "error": e }).to_string(),
+        };
+
+        let mut report = match serde_json::to_value(&conversion) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                // The Turtle is returned only on request; it is large.
+                map.remove("turtle");
+                serde_json::Value::Object(map)
+            }
+            Ok(other) => other,
+            Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+        };
+
+        if input.load.unwrap_or(false) {
+            match self.graph.load_turtle(&conversion.turtle, None) {
+                Ok(count) => report["triples_loaded"] = serde_json::json!(count),
+                Err(e) => report["load_error"] = serde_json::json!(e.to_string()),
+            }
+        }
+        if input.include_turtle.unwrap_or(false) {
+            report["turtle"] = serde_json::json!(conversion.turtle);
+        }
+        report.to_string()
+    }
+
+    #[tool(name = "onto_shacl_check", description = "Dry-run structural check on proposed SHACL shapes against the loaded ontology. Verifies that shapes parse as Turtle and that every IRI they reference (sh:targetClass, sh:path, sh:class) exists in the ontology, plus a lightweight XSD-prefix check on sh:datatype, and that every sh:minCount, sh:maxCount, sh:qualifiedMinCount, sh:qualifiedMaxCount, sh:minLength and sh:maxLength value is a non-negative xsd:integer literal (reported as kind ill_formed_literal with the reason). Does NOT validate data — use onto_shacl for that. Use this to iterate on LLM-generated SHACL before applying.")]
+    async fn onto_shacl_check(&self, Parameters(input): Parameters<OntoShaclCheckInput>) -> String {
+        use crate::shacl::ShaclValidator;
+        let shapes = if input.inline.unwrap_or(false) {
+            input.shapes.clone()
+        } else {
+            match std::fs::read_to_string(&input.shapes) {
+                Ok(c) => c,
+                Err(e) => return Self::err_json(format!("Cannot read shapes file: {}", e)),
+            }
+        };
+        ShaclValidator::check_shapes(&self.graph, &shapes)
+            .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_vocab_check", description = "Closed-world vocabulary check on a Turtle DATA graph: verify that every predicate and every rdf:type class used in the data is actually DECLARED in the loaded ontology. Catches hallucinated/undeclared terms — e.g. an LLM emitting `ies:hasDeparturePort` when the ontology only defines `ies:scheduledDeparturePort`. This is the gate open-world SHACL structurally CANNOT provide: SHACL silently ignores predicates it has no shape for, so a graph full of invented terms still reports conforms=true. Only IRIs whose namespace belongs to the ontology (plus any passed in `namespaces`) are policed; standard rdf/rdfs/owl/xsd/sh vocabulary and your instance-data IRIs are never flagged. Returns {conforms, hallucinated_terms, checked_namespaces}. Companion to `onto_shacl` (open-world structural validation of data) and `onto_shacl_check` (checks proposed SHACL shapes); run this on generated data to catch fabricated vocabulary before it enters the store.")]
+    async fn onto_vocab_check(&self, Parameters(input): Parameters<OntoVocabCheckInput>) -> String {
+        let data = if input.inline.unwrap_or(false) {
+            input.data.clone()
+        } else {
+            match std::fs::read_to_string(&input.data) {
+                Ok(c) => c,
+                Err(e) => return Self::err_json(format!("Cannot read data file: {}", e)),
+            }
+        };
+        let extra = input.namespaces.clone().unwrap_or_default();
+        crate::vocab_check::check_data_vocab(&self.graph, &data, &extra)
+            .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_align_flora", description = "End-to-end FLORA alignment (#38). Takes the currently-loaded graph as source and a Turtle string for target, enumerates plausible class-pairs (pre-filtered by shared label tokens), extracts the four FLORA signals per pair (label Jaccard, parent overlap, sibling overlap, datatype overlap) from the structural neighbourhood, runs the 10-rule Mamdani inference engine, and returns only the accept-verdict pairs. Companion to `onto_align_fuzzy` (per-pair adjudication when you already have signals).")]
+    async fn onto_align_flora(&self, Parameters(input): Parameters<OntoAlignFloraInput>) -> String {
+        let target = std::sync::Arc::new(crate::graph::GraphStore::new());
+        if let Err(e) = target.load_turtle(&input.target_ttl, None) {
+            return Self::err_json(format!("target_ttl failed to parse: {}", e));
+        }
+        let low = input.low_threshold.unwrap_or(0.4);
+        let high = input.high_threshold.unwrap_or(0.65);
+        let report = crate::flora_pipeline::align_with_flora(&self.graph, &target, low, high);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e)))
+    }
+
+    #[tool(name = "onto_align_fuzzy", description = "FLORA-style fuzzy-logic alignment adjudication (#38, ISWC 2025 Best Paper). Caller supplies per-pair signals (`label_jaccard`, `parent_overlap`, `sibling_overlap`, `datatype_overlap` all in [0,1]) plus low/high thresholds; server combines via the chosen t-norm (`min` / `product` / `lukasiewicz`) and emits verdict `\"accept\"` / `\"borderline\"` / `\"reject\"` plus a rule trace. Embedding-free, interpretable, complements the HNSW candidate-generator pipeline.")]
+    async fn onto_align_fuzzy(&self, Parameters(input): Parameters<OntoAlignFuzzyInput>) -> String {
+        let signals: crate::align_fuzzy::FuzzySignals = match serde_json::from_str(&input.signals_json) {
+            Ok(s) => s,
+            Err(e) => return Self::err_json(format!("invalid signals_json: {}", e)),
+        };
+        let tnorm = match input.tnorm.as_deref() {
+            Some("product") => crate::align_fuzzy::TNorm::Product,
+            Some("lukasiewicz") => crate::align_fuzzy::TNorm::Lukasiewicz,
+            _ => crate::align_fuzzy::TNorm::Min,
+        };
+        let decision = crate::align_fuzzy::adjudicate(&signals, tnorm, input.low_threshold, input.high_threshold);
+        serde_json::to_string(&decision)
+            .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e)))
+    }
+
+    #[tool(name = "onto_policy_register", description = "Register an ARGOS-style policy rule (#40, ISWC 2025 WOP). `effect` is `\"allow\"` or `\"deny\"`; `condition` is a SPARQL ASK that can use the `{target}` placeholder. Pairs with `onto_policy_check` and `onto_certify_action` — CIVeX gates causal risk, ARGOS gates authorisation.")]
+    async fn onto_policy_register(&self, Parameters(input): Parameters<OntoPolicyRegisterInput>) -> String {
+        let rule = crate::policy::PolicyRule {
+            name: input.name.clone(),
+            effect: input.effect,
+            condition: input.condition,
+            description: input.description,
+        };
+        match crate::policy::register_rule(&self.db, &rule) {
+            Ok(()) => serde_json::json!({"ok":true,"registered":input.name}).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_policy_list", description = "List all registered ARGOS policy rules.")]
+    async fn onto_policy_list(&self) -> String {
+        match crate::policy::list_rules(&self.db) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_policy_check", description = "Evaluate a proposed action's target IRIs against every registered policy rule. Verdict is `\"deny\"` if any `deny` rule fires for any target, else `\"allow\"`. Returns per-rule fire status for audit.")]
+    async fn onto_policy_check(&self, Parameters(input): Parameters<OntoPolicyCheckInput>) -> String {
+        match crate::policy::check_action(&self.db, &self.graph, &input.target_iris) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "eval_rag_mmrag", description = "Parse a full mmRAG dataset JSON and score it in one call. Convenience wrapper around `onto_mmrag_parse` + `eval_rag`. Returns the same `RagEvalReport` as `eval_rag` including faithfulness, answer-jaccard, and rouge1 when records carry generated_answer / gold_answer / retrieved_text.")]
+    async fn eval_rag_mmrag(&self, Parameters(input): Parameters<OntoEvalRagMmragInput>) -> String {
+        let qas = match crate::eval_rag::parse_mmrag_dataset(&input.dataset_json) {
+            Ok(q) => q,
+            Err(e) => return Self::err_json(e),
+        };
+        let report = crate::eval_rag::evaluate(&qas);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e)))
+    }
+
+    #[tool(name = "eval_rag", description = "mmRAG benchmark scoring (#41, ISWC 2025). Input is a JSON array of {question_id, gold_iri, retrieved: [iri, ...]}. Returns Hit@{3,5,10}, MRR, exact-match-at-1, and per-question rank (0 = gold not retrieved).")]
+    async fn eval_rag(&self, Parameters(input): Parameters<OntoEvalRagInput>) -> String {
+        let qas: Vec<crate::eval_rag::RagQa> = match serde_json::from_str(&input.qa_json) {
+            Ok(q) => q,
+            Err(e) => return Self::err_json(format!("invalid qa_json: {}", e)),
+        };
+        let report = crate::eval_rag::evaluate(&qas);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e)))
+    }
+
+    #[tool(name = "onto_classify_el", description = "Classify the loaded ontology by OWL 2 EL completion (#30, #324): conjunction and existentials on both sides, domains, ranges, disjointness, role hierarchy, transitive roles. Returns every derived subsumption between named classes (`owl:Thing` and `X ⊑ X` left out, unsatisfiable classes listed separately), no row cap. `complete: true` only when the input is inside EL and nothing was set aside; otherwise `complete: false`, `incompleteness` names each cause, and the OWL-RL-ext rules are unioned in (sound, not complete). For a complete classification outside EL, use `onto_reason` with `owl-dl`.")]
+    async fn onto_classify_el(&self) -> String {
+        match crate::classify_el::classify(&self.graph) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_eval_alignment", description = "OAEI-style P/R/F1 scoring (#31). Both inputs are JSON arrays of {source, target, relation}; entries match on exact triple equality. Returns precision, recall, F1, TP/FP/FN counts.")]
+    async fn onto_eval_alignment(&self, Parameters(input): Parameters<OntoEvalAlignmentInput>) -> String {
+        let reference: Vec<crate::eval_alignment::AlignmentEntry> =
+            match serde_json::from_str(&input.reference_json) {
+                Ok(r) => r,
+                Err(e) => return Self::err_json(format!("invalid reference_json: {}", e)),
+            };
+        let computed: Vec<crate::eval_alignment::AlignmentEntry> =
+            match serde_json::from_str(&input.computed_json) {
+                Ok(c) => c,
+                Err(e) => return Self::err_json(format!("invalid computed_json: {}", e)),
+            };
+        let report = crate::eval_alignment::evaluate(&reference, &computed);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e)))
+    }
+
+    #[tool(name = "onto_shape_induce", description = "Kastor-style data-driven SHACL shape induction (#36, K-CAP 2025). For each property subset up to `max_size`, compute support (fraction of class instances having all properties) and confidence (fraction of any-instances-with-properties that are class members). Returns the top-k candidates ranked by `support × confidence`, each carrying a ready-to-use SHACL NodeShape Turtle block. Filter via `min_support` (default 0.1) and `min_confidence` (default 0.5).")]
+    async fn onto_shape_induce(&self, Parameters(input): Parameters<OntoShapeInduceInput>) -> String {
+        let max = input.max_size.unwrap_or(3).min(8); // hard cap: guards the combinatorial blow-up at the tool boundary
+        let top_k = input.top_k.unwrap_or(10);
+        let min_support = input.min_support.unwrap_or(0.1);
+        let min_confidence = input.min_confidence.unwrap_or(0.5);
+        match crate::shape_combinatorics::induce_shapes(&self.graph, &input.class_iri, max, top_k, min_support, min_confidence) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_shape_combinatorics", description = "Enumerate the property-combination lattice for a class (#36, K-CAP 2025 Kastor). Returns subsets of the class's rdfs:domain properties up to `max_size` (default 3). Used by shape-induction algorithms to enumerate candidate SHACL shapes from data.")]
+    async fn onto_shape_combinatorics(&self, Parameters(input): Parameters<OntoShapeCombinatoricsInput>) -> String {
+        let max = input.max_size.unwrap_or(3).min(8); // hard cap: guards the combinatorial blow-up at the tool boundary
+        match crate::shape_combinatorics::enumerate(&self.graph, &input.class_iri, max) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "borderline_partition", description = "Generalised borderline-pair partitioning (#37, NORA NeurIPS 2025). Takes a list of {id, score, context} candidates plus low+high thresholds; partitions into auto_accept (>= high), borderline ([low, high)), auto_reject (< low) and emits a review summary the orchestrator's LLM can act on. Pairs with `borderline_record_verdict`.")]
+    async fn borderline_partition(&self, Parameters(input): Parameters<BorderlinePartitionInput>) -> String {
+        let candidates: Vec<crate::borderline_loop::Candidate> =
+            match serde_json::from_str(&input.candidates_json) {
+                Ok(c) => c,
+                Err(e) => return Self::err_json(format!("invalid candidates_json: {}", e)),
+            };
+        let report = crate::borderline_loop::partition(candidates, input.low_threshold, input.high_threshold);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e)))
+    }
+
+    #[tool(name = "borderline_record_verdict", description = "Persist an orchestrator's verdict on a borderline candidate (#37). verdict must be \"accept\" or \"reject\". Namespaces let independent borderline loops coexist.")]
+    async fn borderline_record_verdict(&self, Parameters(input): Parameters<BorderlineRecordVerdictInput>) -> String {
+        let v = crate::borderline_loop::BorderlineVerdict {
+            candidate_id: input.candidate_id.clone(),
+            namespace: input.namespace.unwrap_or_else(|| "default".to_string()),
+            verdict: input.verdict,
+            rationale: input.rationale,
+        };
+        match crate::borderline_loop::record_verdict(&self.db, &v) {
+            Ok(()) => serde_json::json!({"ok":true,"candidate_id":input.candidate_id}).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_extract_scaffold", description = "Build a schema-guided structured-extraction scaffold for a class (#28, OntoGPT SPIRES MCP-native). Returns the class metadata (label, comment), the property schema derived from rdfs:domain triples that target the class, and a ready-to-use prompt template the orchestrator can hand to its LLM. The server doesn't run the LLM; it scaffolds the prompt and validates the LLM's output via `onto_extract_validate`.")]
+    async fn onto_extract_scaffold(&self, Parameters(input): Parameters<OntoExtractScaffoldInput>) -> String {
+        match crate::extract_scaffold::build_scaffold(&self.graph, &input.class_iri) {
+            Ok(s) => serde_json::to_string(&s)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_extract_validate", description = "Validate an LLM-supplied extraction (JSON array of objects) against a scaffold previously emitted by `onto_extract_scaffold`. Returns per-instance valid/invalid counts and field-level issue reports.")]
+    async fn onto_extract_validate(&self, Parameters(input): Parameters<OntoExtractValidateInput>) -> String {
+        let scaffold: crate::extract_scaffold::ExtractionScaffold =
+            match serde_json::from_str(&input.scaffold_json) {
+                Ok(s) => s,
+                Err(e) => return Self::err_json(format!("invalid scaffold_json: {}", e)),
+            };
+        match crate::extract_scaffold::validate_extraction(&scaffold, &input.extraction_json) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_cq_run", description = "Run a batch of competency questions (CQs) against the loaded ontology (#29). Each CQ has an id, a natural-language question, a SPARQL query, and an optional expected_min_rows. Returns per-CQ pass/fail plus VSPO-pitfall hints (P10: empty result, P11: no rdfs:label, P12: > 10k rows). Pairs with `onto_verify_cq` for the LLM-judgement loop.")]
+    async fn onto_cq_run(&self, Parameters(input): Parameters<OntoCqRunInput>) -> String {
+        let cqs: Vec<crate::cq::CompetencyQuestion> = match serde_json::from_str(&input.cqs_json) {
+            Ok(c) => c,
+            Err(e) => return Self::err_json(format!("invalid cqs_json: {}", e)),
+        };
+        let report = crate::cq::run_cq_suite(&self.graph, &cqs);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e)))
+    }
+
+    #[tool(name = "onto_verify_cq", description = "Persist an LLM-supplied (or human-supplied) verdict on a CQ result (#39, ISWC 2025 Lippolis). verdict must be one of \"correct\", \"incorrect\", \"partial\". Server stores verdicts; the LLM does the judging. Pairs with `onto_cq_run`.")]
+    async fn onto_verify_cq(&self, Parameters(input): Parameters<OntoVerifyCqInput>) -> String {
+        let v = crate::cq::CqVerdict {
+            cq_id: input.cq_id.clone(),
+            verdict: input.verdict,
+            rationale: input.rationale,
+            judge: input.judge,
+        };
+        match crate::cq::verify_cq(&self.db, &v) {
+            Ok(()) => serde_json::json!({"ok":true,"cq_id":input.cq_id}).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_cq_verdicts_list", description = "List all stored verdicts for a CQ id, most-recent first.")]
+    async fn onto_cq_verdicts_list(&self, Parameters(input): Parameters<OntoCqVerdictsListInput>) -> String {
+        match crate::cq::list_cq_verdicts(&self.db, &input.cq_id) {
+            Ok(v) => serde_json::to_string(&v)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_segment_retrieve", description = "Retrieve a TBox-slice neighbourhood of seed IRIs for grounding LLM reasoning (#34, SEMANTiCS 2025 GrOWL-RAG). Walks `rdfs:subClassOf` / `subPropertyOf` / `domain` / `range` + `owl:equivalentClass` / `equivalentProperty` / `disjointWith` / `inverseOf` to `hops` depth (default 2). Returns the slice as Turtle plus IRI/triple counts and any frontier IRIs hit at the hop budget. Pairs with `graph_projection_lossy_check`: this retrieves, that audits. Pass `include_abox=true` to also pull instance triples for each seed. A NEIGHBOURHOOD IS NOT A MODULE: the hop budget is a heuristic, so what this drops has to be measured afterwards by onto_closure_diff. When the question is 'give me the part of the ontology that matters for these IRIs' and losing an entailment over them is not acceptable, use onto_module_extract instead, which carries a coverage theorem rather than a loss report.")]
+    async fn onto_segment_retrieve(&self, Parameters(input): Parameters<OntoSegmentRetrieveInput>) -> String {
+        let hops = input.hops.unwrap_or(2);
+        let include_abox = input.include_abox.unwrap_or(false);
+        match crate::segment_retrieve::retrieve_segment(&self.graph, &input.seed_iris, hops, include_abox) {
+            Ok(result) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_coevolve_dependency_graph", description = "Build the shape→OWL-dependency map for a SHACL document. For each NodeShape, returns the set of target classes, path properties, and class-constraint targets. Powers `onto_owl_shacl_coevolve_incremental`.")]
+    async fn onto_coevolve_dependency_graph(&self, Parameters(input): Parameters<OntoCoevolveDepGraphInput>) -> String {
+        match crate::coevolve::build_dependency_graph(&input.shapes_ttl) {
+            Ok(d) => serde_json::to_string(&d)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_owl_shacl_coevolve_incremental", description = "Incremental coevolve check (#33 follow-on, K-CAP 2025). Given a list of IRIs that changed since the last validation, identify which SHACL shapes are affected (via the shape→OWL dependency graph) and skip SHACL validation entirely when no shape's dependencies overlap. Returns the affected-shapes report plus validation output (or 'no_affected_shapes' sentinel when nothing fires).")]
+    async fn onto_owl_shacl_coevolve_incremental(&self, Parameters(input): Parameters<OntoCoevolveIncrementalInput>) -> String {
+        let profile = input.profile.unwrap_or_else(|| "owl-rl".to_string());
+        match crate::coevolve::incremental_check(&self.graph, &input.shapes_ttl, &input.changed_iris, &profile) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_owl_shacl_coevolve_check", description = "Combined OWL+SHACL validation (#33, K-CAP 2025). Materialises OWL-RL entailments into a sandbox copy of the loaded graph, then runs SHACL validation against the closure. Returns both the pre-reasoning and post-reasoning conformance verdicts plus the count of triples the reasoner added. Catches SHACL constraints that pass against the raw ABox but fail after inference (e.g. instances that inherit a parent class via rdfs:subClassOf and then violate a parent-class shape). Original graph is NOT mutated.")]
+    async fn onto_owl_shacl_coevolve_check(&self, Parameters(input): Parameters<OntoOwlShaclCoevolveInput>) -> String {
+        let profile = input.profile.unwrap_or_else(|| "owl-rl".to_string());
+        match crate::coevolve::coevolve_check(&self.graph, &input.shapes_ttl, &profile) {
+            Ok(report) => serde_json::to_string(&report)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "graph_projection_lossy_check", description = "Audit a projected Turtle slice against the loaded ontology's full neighbourhood of the seed IRIs. Reports dropped predicates, dropped object IRIs, per-seed coverage ratio, and aggregate coverage. COVERAGE RATIO IS A PROXY AND IS NOT ASSURANCE: it is neither necessary nor sufficient for entailment preservation, a slice at 0.99 can have dropped the one triple an answer rests on, a slice at 0.60 can preserve every claim, and it RISES as the projection grows, so a retriever tuned on it learns to fetch more rather than the right thing. Measured on this repository's own pizza-reference.owl, the whole ontology minus one subClassOf triple scores 1.0 with ok:true while a conclusion the source derives is gone. For the property itself use graph_projection_entailment_check (goal-directed, machine-checked certificate per preserved claim) or onto_closure_diff (goal-free, whole retrieval strategy). Per IJCAI 2025 'How to Mitigate Information Loss in KGs for GraphRAG'.")]
+    async fn graph_projection_lossy_check(&self, Parameters(input): Parameters<GraphProjectionLossyCheckInput>) -> String {
+        match crate::projection_check::check_projection_loss(&self.graph, &input.source_iris, &input.projected_ttl) {
+            Ok(report) => serde_json::to_string(&report)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "graph_projection_entailment_check", description = "Does a retrieved slice still support the claims an answer rests on? Supply the claims as Turtle (goals_ttl); for each one this reports whether the projection entails it exactly when the source does, under one pinned rule profile, with a machine-checked Lean certificate (OOCert.certificate_sound) for each claim the projection preserves. Four outcomes, never collapsed: preserved (checked / asserted / unchecked), lost_under_profile_unchecked (the retrieval finding), ungrounded_in_source (NEITHER graph derives it, so the generator invented it and a better retriever will not help), and projection_only (the projection is not a subset, or the engine is unsound). Every run also verifies monotonicity: nothing may be entailed by the projection and not by the source, and a violation is STOP_THE_LINE rather than a retrieval result. Blank-node and non-triple claims are refused by name and counted. Coverage ratio is included, demoted, and labelled as a proxy that is not a warrant.")]
+    async fn graph_projection_entailment_check(
+        &self,
+        Parameters(input): Parameters<GraphProjectionEntailmentCheckInput>,
+    ) -> String {
+        use crate::projection_entailment as pe;
+        if input.projected_ttl.is_some() == input.projection_graph.is_some() {
+            return Self::err_json(
+                "pass exactly one of projected_ttl and projection_graph. A named graph of the \
+                 loaded store keeps blank node identity, so P ⊆ G can be verified over every \
+                 triple rather than over the ground ones only",
+            );
+        }
+        let (goals, refused) = match pe::parse_goals_turtle(&input.goals_ttl) {
+            Ok(v) => v,
+            Err(e) => return Self::err_json(e),
+        };
+        let work = input.certificate_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("oo-preserve-{}", std::process::id()))
+        });
+        let opts = pe::Opts {
+            profile: input.profile.unwrap_or_else(|| "owl-rl".to_string()),
+            rules: None,
+            work_dir: work,
+            checker: None,
+            require_checker: input.require_checker.unwrap_or(false),
+            seed_iris: input.seed_iris,
+        };
+        let ttl = input.projected_ttl.unwrap_or_default();
+        let projection = match &input.projection_graph {
+            Some(g) => pe::Projection::NamedGraph(g),
+            None => pe::Projection::Turtle(&ttl),
+        };
+        match pe::check_entailment_preservation(&self.graph, projection, &goals, &refused, &opts) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_closure_diff", description = "Which CONCLUSIONS a projection preserves, with no goals supplied. Reasons the source and the slice to a fixpoint under the same rule table and reports closure(source) minus closure(projection), partitioned by whether every term of the lost conclusion occurs in the projection: lost_in_projection_vocabulary is the headline, because a conclusion over terms the slice never mentions cannot ground an answer the slice supports. Each lost row names the rule and the blocking premises the retriever dropped. Three warrant words, never collapsed: checked (a Lean-accepted certificate, OOCert.certificate_sound), asserted_in_source (a lookup, nothing was proved), engine_opinion (no checker looked, or it said no). Also runs the monotonicity gate and reports when the gate did NOT run and why, so an empty violation list can never mean 'we did not look'. Skolemises the source by default so blank-node-bearing triples can be compared at all. The offline form; graph_projection_entailment_check is the per-answer one. This MEASURES loss and is the right tool for a slice; a locality module from onto_module_extract has no loss to measure over its signature, and this is what verifies that.")]
+    async fn onto_closure_diff(&self, Parameters(input): Parameters<OntoClosureDiffInput>) -> String {
+        use crate::closure_diff as cd;
+        let opts = cd::DiffOptions {
+            profile: input.profile.unwrap_or_else(|| "owl-rl-ext".to_string()),
+            out: std::path::PathBuf::from(&input.out_dir),
+            checker: None,
+            skolemise_source: input.skolemise_source.unwrap_or(true),
+            max_rows: input.max_rows.unwrap_or(200),
+            seed_iris: input.seed_iris,
+        };
+        match cd::closure_diff(&self.graph, &input.projected_ttl, &opts) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_trace_label", description = "Label each step of a reasoning trace against the rule table, with a machine-checked verdict per step rather than a model's opinion. Supply the trace as oo-trace/1: one step per line, `rule TAB conclusion TAB premise*`, each triple three tab-separated N-Triples terms. That is the same line a derivations.tsv from onto_reason carries, so a certificate this engine wrote is itself a valid trace. THREE FAMILIES AND THE THIRD IS THE PRODUCT. `entailed`: a Lean checker accepted a certificate slice of the run that concludes the triple, so it is true in every model of the store (OOCert.certificate_sound). `not_entailed`: some rule head in the table could conclude a triple of this shape, every axiom the step cites is inside the Horn fragment, and the graph still does not support it. `outside_the_fragment`: no rule in this table could EVER derive it, and the two reasons are never merged, exactly as onto_dlp_boundary never merges them. `outside_the_fragment` means an axiom the step cites is one the Horn fragment cannot express (a disjunction in the consequent, an existential in the head, a cardinality restriction, a negation in the antecedent) and only a rewrite of the ontology helps; `no_rule_in_this_table_concludes_this_shape` means no head in the table unifies with the conclusion, decided from the table alone with no reference to any data, and a different engine would see it. TWO ANSWERS PER STEP, NEVER MERGED. `local` is a one-line certificate over the step's OWN cited premises, so a step whose reasoning is valid over triples the graph does not hold reads local=locally_sound_checked with premises_in_store=false and label=locally_sound_but_premises_not_in_the_store. That is a step reasoning from premises it invented and it is half of what a per-step labeller is for. A THIRD FIELD: `rule_claim` says whether the cited rule is what licenses the step. rule_not_in_table is reported and the step is still labelled on its conclusion, because saying not_entailed for a mistyped rule name would be a false statement about the ontology, and because an unknown rule name makes the Lean parser exit 2 (unreadable) rather than 1 (rejected). With rules_file the table is YOURS and nothing discharges it: every checked step then earns entailed_under_supplied_rules_checked under OOCert.horn_certificate_sound, true in every model of the store THAT ALSO SATISFIES your rules, the family word carries the same qualification, and the report carries rules_tsv_sha256 and conditional_on. That word is read off the theorem name the checker printed and is not chosen here, so it cannot be shortened. `not_entailed` is bounded by a table implementing 29 of OWL 2 RL's 78 rules and RDF entailment is open-world, so it is never 'false'. Every label writes a labels.jsonl record naming the exact command that reproduces it.")]
+    async fn onto_trace_label(&self, Parameters(input): Parameters<OntoTraceLabelInput>) -> String {
+        use crate::trace_label as tl;
+        if input.trace_tsv.is_some() == input.trace_file.is_some() {
+            return Self::err_json(
+                "pass exactly one of trace_tsv and trace_file. A trace inline and a trace on disk \
+                 are the same format, and reading both would leave which one was labelled up to \
+                 this code rather than to you",
+            );
+        }
+        let text = match (&input.trace_tsv, &input.trace_file) {
+            (Some(t), _) => t.clone(),
+            (_, Some(p)) => match std::fs::read_to_string(p) {
+                Ok(t) => t,
+                Err(e) => return Self::err_json(format!("cannot read {p}: {e}")),
+            },
+            _ => unreachable!("the exclusivity check above covers both-absent"),
+        };
+        let steps = match tl::parse_trace(&text) {
+            Ok(s) => s,
+            Err(e) => return Self::err_json(e.to_string()),
+        };
+        let opts = tl::Opts {
+            profile: input.profile.unwrap_or_else(|| "owl-rl".to_string()),
+            rules: input.rules_file.map(std::path::PathBuf::from),
+            work_dir: std::path::PathBuf::from(&input.out_dir),
+            checker: None,
+            require_checker: input.require_checker.unwrap_or(false),
+        };
+        match tl::label_trace(&self.graph, &steps, &opts) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_module_extract", description = "A MODULE over a signature, not a slice: the smallest subset of the axioms syntactic locality can justify, such that every entailment of the WHOLE ontology over those IRIs is still an entailment of the subset. Where onto_segment_retrieve retrieves a neighbourhood and onto_closure_diff then MEASURES what it lost, this cannot lose anything over the signature, and the difference is a theorem rather than a metric: Cuenca Grau, Horrocks, Kazakov and Sattler, JAIR 31 (2008), for ⊥-locality, ⊤-locality and the iterated ⊥⊤*. THAT THEOREM IS CITED, NOT MACHINE-CHECKED: nothing under lean/ is about locality, so this names a paper and never names a Lean theorem — pass verify_out_dir to have the consequence measured instead, which reasons the ontology and the module to a fixpoint and reports every conclusion over the signature the module does not reach (which must be none). THE GUARANTEE COVERS these axiom types, each with a locality test written for it: SubClassOf, EquivalentClasses, DisjointClasses, DisjointUnion, SubPropertyOf, property chains, EquivalentProperties, DisjointProperties, domain, range, InverseProperties, the seven property characteristics (transitive, symmetric, asymmetric, reflexive, irreflexive, functional, inverse-functional), HasKey, class assertions, property assertions, negative property assertions, declarations and annotations, over class expressions built from intersection, union, complement, oneOf, someValuesFrom, allValuesFrom, hasValue, hasSelf and the six cardinality forms. INCLUDED CONSERVATIVELY, with no locality test, because no replacement can make them tautologies: owl:sameAs, owl:differentFrom, owl:AllDifferent, every unrecognised predicate in the RDF/RDFS/OWL/XSD namespaces, every blank-node structure whose shape is not one of the above, and every malformed rdf:List. Those are COUNTED AND NAMED in the report, so a module that is small and a module that was unreadable cannot look the same. Datatypes are never treated as class names, because replacing xsd:integer by ⊥ would make ∃hasAge.xsd:integer look local and drop the axiom. TWO PLACES WHERE OWL 2 AND THIS ENGINE'S RULE TABLE DISAGREE, both resolved towards the rule table: a declaration (X rdf:type owl:Class) is logically vacuous in OWL 2 and is a PREMISE of OWL 2 RL's scm-cls, and X rdf:type owl:Thing is a tautology in OWL 2 that the rule table does not regenerate, so both are kept whenever the term is in the signature. Annotation assertions (rdfs:label, rdfs:comment and the rest) are NOT in the logical module; the vacuity is checked rather than assumed, so an annotation predicate the ontology gives a domain, range, superproperty or equivalent is kept as a property assertion instead, and annotation_predicates_treated_as_vacuous lists what was dropped. Pass include_annotations to carry the labels along for reading; the logical module is the same either way.")]
+    async fn onto_module_extract(&self, Parameters(input): Parameters<OntoModuleExtractInput>) -> String {
+        use crate::module_extract as me;
+        let locality = match me::Locality::parse(input.locality.as_deref().unwrap_or("star")) {
+            Ok(l) => l,
+            Err(e) => return Self::err_json(e),
+        };
+        let opts = me::ModuleOptions {
+            signature: input.signature,
+            locality,
+            include_annotations: input.include_annotations.unwrap_or(false),
+            max_rows: input.max_rows.unwrap_or(200),
+        };
+        let report = match me::extract_module(&self.graph, &opts) {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(e),
+        };
+        let mut body = match serde_json::to_value(&report) {
+            Ok(v) => v,
+            Err(e) => return Self::err_json(format!("serialization: {}", e)),
+        };
+        // A module that was never verified and a module that verified clean
+        // must not render the same, so the absence is a field.
+        body["verification"] = match input.verify_out_dir {
+            None => serde_json::json!({
+                "ran": false,
+                "skipped": "not requested. Pass verify_out_dir to reason the whole ontology and \
+                            the module to a fixpoint and report every conclusion over the \
+                            signature the module does not reach, which must be none.",
+            }),
+            Some(dir) => {
+                let diff = crate::closure_diff::DiffOptions {
+                    profile: input.verify_profile.unwrap_or_else(|| "owl-rl-ext".to_string()),
+                    out: std::path::PathBuf::from(dir),
+                    max_rows: opts.max_rows,
+                    ..Default::default()
+                };
+                match me::verify_module(
+                    &self.graph,
+                    &report,
+                    &diff,
+                    input.verify_scan_rows.unwrap_or(200_000),
+                ) {
+                    Ok(v) => {
+                        let mut v = serde_json::to_value(&v).unwrap_or_default();
+                        v["ran"] = serde_json::Value::Bool(true);
+                        v
+                    }
+                    Err(e) => serde_json::json!({
+                        "ran": false,
+                        "skipped": format!("the verification could not run: {e}"),
+                    }),
+                }
+            }
+        };
+        body.to_string()
+    }
+
+    #[tool(name = "onto_conservative_check", description = "Does adding these axioms change anything the ontology ALREADY said? Reasons base and base+extension to a fixpoint under one rule table and reports closure(base ∪ extension) minus closure(base), restricted to triples every name of which the base already used. Each row names the rule that produced it and the premises the base did not have, so the change can be judged on the derivation rather than on a verdict word. A NON-CONSERVATIVE EXTENSION IS A FINDING, NOT AN ERROR: changing what the ontology says about existing terms is often the intended change, and the point is that it should be intended rather than discovered later. BE CLEAR ABOUT THE FRAGMENT. The verdict field is conservativity_verdict with five words (conservative_under_rule_table, not_conservative_under_rule_table, undecided_scan_truncated, undecided_not_an_extension, undecided_engine_soundness_violation) and the boolean beside it is conservative_under_rule_table, null whenever the answer is undecided rather than false, because a reader takes false for a finding. The monotonicity gate runs on every call and its violation gets its OWN word: the base is a subset of the extended graph by construction and the rule table is monotone, so a conclusion the base reaches and the extension does not is an engine soundness bug, and folding it into not_conservative would send it to the ontology's author instead of the engine's. There is deliberately no field called `conservative`. What is computed is conservativity WITH RESPECT TO THE HORN RULE TABLE this engine evaluates, which derives only positive ground triples. It is NOT deductive conservativity in a description logic (ExpTime-complete for EL, 2ExpTime-complete for ALC, UNDECIDABLE for ALCQIO) and NOT model conservativity (undecidable already for EL). The asymmetry is the point: a new consequence reported here IS a real change to what this engine derives over the old names, while finding none establishes only that this rule table derives nothing new. onto_plan takes check_conservativity=true to run the same check as part of a plan, which is where it belongs.")]
+    async fn onto_conservative_check(&self, Parameters(input): Parameters<OntoConservativeCheckInput>) -> String {
+        use crate::conservativity as cx;
+        let mode = match cx::ExtensionMode::parse(input.mode.as_deref().unwrap_or("delta")) {
+            Ok(m) => m,
+            Err(e) => return Self::err_json(e),
+        };
+        let opts = cx::ConservativityOptions {
+            mode,
+            profile: input.profile.unwrap_or_else(|| "owl-rl".to_string()),
+            out: std::path::PathBuf::from(&input.out_dir),
+            scan_rows: input.scan_rows.unwrap_or(200_000),
+            max_rows: input.max_rows.unwrap_or(100),
+        };
+        match cx::conservativity_check(&self.graph, &input.extension_ttl, &opts) {
+            Ok(r) => serde_json::to_string(&r)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_certify_action", description = "CIVeX-style causal certificate for a proposed state-changing ontology action. Returns a verdict (EXECUTE / REJECT / EXPERIMENT / ABSTAIN) plus an auditable certificate documenting the assumptions, structural-dependency identification proof, utility point estimate + one-sided lower confidence bound, provenance hash, and risk bound. Use as a pre-flight gate for onto_apply / onto_save / onto_push / onto_ingest. Scaffold port of arXiv:2605.09168 — structural-dependency proxy in place of full do-calculus identifiability; documented honestly.")]
+    async fn onto_certify_action(&self, Parameters(input): Parameters<OntoCertifyActionInput>) -> String {
+        let frame = crate::civex::ActionFrame {
+            tool: input.tool,
+            target_iris: input.target_iris,
+            proposed_delta_ttl: input.proposed_delta_ttl,
+            utility_metric: input.utility_metric,
+            dependent_queries: input.dependent_queries,
+            cost_threshold: input.cost_threshold,
+            utility_threshold: input.utility_threshold,
+            risk_threshold: input.risk_threshold,
+            reversible: input.reversible,
+            allow_experiment: input.allow_experiment,
+            alpha: input.alpha,
+            action_schema_name: input.action_schema_name,
+            identification_mode: match input.identification_mode.as_deref() {
+                Some("do_calculus_backdoor") => crate::civex::IdentificationMode::DoCalculusBackdoor,
+                _ => crate::civex::IdentificationMode::Structural,
+            },
+        };
+        match crate::civex::certify_action(&self.db, &self.graph, &frame) {
+            Ok(result) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    // ── Dynamics layer (#43) — action schemas, applicability, apply ────────
+
+    #[tool(name = "onto_action_register", description = "Persist a named action schema (Dynamics layer #43). Schema specifies typed parameters, SPARQL preconditions, and KGCL-shaped effects (add_triple/remove_triple/add_class). `{param}` placeholders are substituted at apply time. Schemas are looked up by `onto_action_applicable` and executed by `onto_action_apply`. Companion to the Causal layer (`onto_certify_action`) and the Planner (`onto_plan_compile_pddl`). BC+ deterministic-single-effect subset; ramification + non-determinism deferred to v0.4.x.")]
+    async fn onto_action_register(&self, Parameters(input): Parameters<OntoActionRegisterInput>) -> String {
+        let schema: crate::dynamics::ActionSchema = match serde_json::from_str(&input.schema_json) {
+            Ok(s) => s,
+            Err(e) => return Self::err_json(format!("invalid schema_json: {}", e)),
+        };
+        let name = schema.name.clone();
+        match crate::dynamics::register(&self.db, &schema) {
+            Ok(()) => serde_json::json!({"ok":true,"registered":name}).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_action_applicable", description = "Evaluate a registered action's SPARQL preconditions against the loaded graph under the given parameter bindings. Returns {applicable: bool, action_name, bindings, preconditions_evaluated}. Use as a pre-flight check before `onto_action_apply` or as the applicability oracle for the Planner.")]
+    async fn onto_action_applicable(&self, Parameters(input): Parameters<OntoActionApplicableInput>) -> String {
+        let schema = match crate::dynamics::lookup(&self.db, &input.action_name) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Self::err_json(format!("unknown action: {}", input.action_name)),
+            Err(e) => return Self::err_json(e),
+        };
+        let bindings: Vec<(String, String)> = input.bindings.into_iter().collect();
+        let applicable = schema.applicable(&self.graph, &bindings);
+        let body = serde_json::json!({
+            "applicable": applicable,
+            "action_name": schema.name,
+            "bindings": bindings,
+            "preconditions_evaluated": schema.preconditions.len(),
+        });
+        body.to_string()
+    }
+
+    #[tool(name = "onto_action_apply", description = "Apply a registered action's effects with the given parameter bindings. Returns the KGCL patch (CNL form), the IES4-style event IRI for the audit trail, and triples added/removed. Re-checks preconditions by default; set `check_preconditions=false` only after a successful `onto_certify_action` certificate. Optional ramification (#47): pass `ramify=\"rdfs\"|\"owl-rl\"|\"owl-rl-ext\"|\"owl-dl\"` to materialise downstream entailments after the literal effects land; the result includes `derived_triples_added` so callers can see what the reasoner produced. Pair with `onto_certify_action` for gated changes.")]
+    async fn onto_action_apply(&self, Parameters(input): Parameters<OntoActionApplyInput>) -> String {
+        let schema = match crate::dynamics::lookup(&self.db, &input.action_name) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Self::err_json(format!("unknown action: {}", input.action_name)),
+            Err(e) => return Self::err_json(e),
+        };
+        let bindings: Vec<(String, String)> = input.bindings.into_iter().collect();
+        if input.check_preconditions && !schema.applicable(&self.graph, &bindings) {
+            return r#"{"error":"preconditions not satisfied"}"#.to_string();
+        }
+        let outcome = match (input.ramify.as_deref(), input.seed) {
+            (Some(profile), _) if !profile.is_empty() => {
+                schema.apply_with_ramification(&self.graph, &self.db, &bindings, profile)
+            }
+            (_, Some(seed)) => {
+                schema.apply_with_seed(&self.graph, &self.db, &bindings, seed)
+            }
+            _ => schema.apply(&self.graph, &self.db, &bindings),
+        };
+        match outcome {
+            Ok(result) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    // ── Full BC+ semantics (#43 follow-on) ──────────────────────────────
+
+    #[tool(name = "onto_action_apply_concurrent", description = "Fire a tick of concurrent BC+ actions atomically. All steps are pre-computed against the pre-tick state, conflict-checked (add-vs-remove of the same triple across distinct steps), then committed as a single batch. If any conflict OR any registered invariant fails post-commit, the entire tick is rolled back and NO step is applied. Non-deterministic schemas in a concurrent tick are rejected — pre-sample with `apply_with_seed` first.")]
+    async fn onto_action_apply_concurrent(&self, Parameters(input): Parameters<OntoActionApplyConcurrentInput>) -> String {
+        let steps: Vec<crate::dynamics_bcplus::ConcurrentStep> = input.steps.into_iter()
+            .map(|s| crate::dynamics_bcplus::ConcurrentStep {
+                action_name: s.action_name,
+                bindings: s.bindings,
+            })
+            .collect();
+        match crate::dynamics_bcplus::apply_concurrent(&self.db, &self.graph, &steps) {
+            Ok(result) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_invariant_register", description = "Persist a BC+ static causal law (SPARQL ASK invariant). The query MUST return `true` for the law to hold; concurrent ticks that violate any registered invariant are rolled back. Body can be a full ASK query or just the body inside `{ ... }`.")]
+    async fn onto_invariant_register(&self, Parameters(input): Parameters<OntoInvariantRegisterInput>) -> String {
+        let law = crate::dynamics_bcplus::StaticCausalLaw {
+            name: input.name.clone(),
+            ask_query: input.ask_query,
+            description: input.description,
+        };
+        match crate::dynamics_bcplus::register_invariant(&self.db, &law) {
+            Ok(()) => serde_json::json!({"ok":true,"registered":input.name}).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_invariant_list", description = "List all registered BC+ static causal laws (invariants).")]
+    async fn onto_invariant_list(&self) -> String {
+        match crate::dynamics_bcplus::list_invariants(&self.db) {
+            Ok(laws) => serde_json::to_string(&laws)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_invariant_remove", description = "Remove a registered BC+ invariant by name.")]
+    async fn onto_invariant_remove(&self, Parameters(input): Parameters<OntoInvariantRemoveInput>) -> String {
+        match crate::dynamics_bcplus::remove_invariant(&self.db, &input.name) {
+            Ok(removed) => format!(r#"{{"removed":{}}}"#, removed),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_invariant_check", description = "Evaluate every registered BC+ invariant against the current graph and return the names + descriptions of any that fail. Empty list means every invariant holds.")]
+    async fn onto_invariant_check(&self) -> String {
+        match crate::dynamics_bcplus::check_invariants(&self.db, &self.graph) {
+            Ok(violations) => serde_json::to_string(&violations)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_default_register", description = "Register a BC+ default-value law. When the `condition_ask` SPARQL ASK returns `true`, the listed `defaults` triples are asserted (added if not already present) on the next call to `onto_default_apply`. Idempotent.")]
+    async fn onto_default_register(&self, Parameters(input): Parameters<OntoDefaultRegisterInput>) -> String {
+        let defaults: Vec<(String, String, String)> = input.defaults.into_iter()
+            .filter_map(|t| if t.len() == 3 { Some((t[0].clone(), t[1].clone(), t[2].clone())) } else { None })
+            .collect();
+        let law = crate::dynamics_bcplus::DefaultLaw {
+            name: input.name.clone(),
+            condition_ask: input.condition_ask,
+            defaults,
+            description: input.description,
+        };
+        match crate::dynamics_bcplus::register_default(&self.db, &law) {
+            Ok(()) => serde_json::json!({"ok":true,"registered":input.name}).to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_default_apply", description = "Apply every registered BC+ default-value law whose condition currently holds. Adds only triples that don't already exist. Returns the names of laws that fired and the triples added.")]
+    async fn onto_default_apply(&self) -> String {
+        match crate::dynamics_bcplus::apply_defaults(&self.db, &self.graph) {
+            Ok(result) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_action_list", description = "List the names of all action schemas registered in this server's Dynamics store. Useful for the Planner / Claude to know what's available before composing a plan.")]
+    async fn onto_action_list(&self) -> String {
+        match crate::dynamics::list_names(&self.db) {
+            Ok(names) => serde_json::to_string(&names)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_plan_classical", description = "Invoke Fast Downward as a subprocess on a precompiled PDDL domain + problem (#50). Returns the raw sas_plan content plus a parsed `operators` list (operator name + positional PDDL args). The orchestrator maps args back to original IRIs using the schema parameter names (still client-side per LLM-Modulo). If Fast Downward is not on PATH and `fast_downward_bin` is not set, returns a clean `binary_unavailable` error rather than falling back to a silent stub. Pair: `onto_plan_compile_pddl` → `onto_plan_classical` → IRI-bind operators client-side → `onto_plan_validate`.")]
+    async fn onto_plan_classical(&self, Parameters(input): Parameters<OntoPlanClassicalInput>) -> String {
+        match crate::plan_classical::run_fast_downward(
+            &input.domain,
+            &input.problem,
+            input.fast_downward_bin.as_deref(),
+            input.search.as_deref(),
+        ) {
+            Ok(result) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_plan_validate", description = "Validate a candidate plan (sequence of registered-action steps) against the loaded graph WITHOUT mutating the real store. Per LLM-Modulo (Kambhampati arXiv 2402.01817), the server validates plans the client-side solver produced — it does not solve. For each step, the validator re-evaluates the schema's preconditions against the cumulative sandbox state and applies effects to a forked copy; the first failing step short-circuits with a diagnostic. Optional `goal_facts` are checked post-plan and reported in `unsatisfied_goals` (without invalidating the plan itself). Pair with `onto_plan_compile_pddl` (server compiles → external solver searches → server validates).")]
+    async fn onto_plan_validate(&self, Parameters(input): Parameters<OntoPlanValidateInput>) -> String {
+        let steps: Vec<crate::plan_validate::PlanStep> = input.steps.into_iter()
+            .map(|s| crate::plan_validate::PlanStep {
+                action_name: s.action_name,
+                bindings: s.bindings,
+            })
+            .collect();
+        let goal_facts: Vec<(String, String, String)> = input.goal_facts.into_iter()
+            .filter_map(|t| if t.len() == 3 { Some((t[0].clone(), t[1].clone(), t[2].clone())) } else { None })
+            .collect();
+        match crate::plan_validate::validate_plan(&self.db, &self.graph, &steps, &goal_facts) {
+            Ok(result) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_plan_compile_pddl", description = "Compile a PDDL domain from registered Dynamics action schemas (#43) plus a problem instance from the loaded graph and a goal Turtle slice (#45 Planner stub). Returns {domain, problem, translation_notes}. The actual planner (Fast Downward) is wrapped client-side per the LLM-Modulo convention — this primitive only emits the PDDL. Lossy in the v0.4 stub: only ASK-shape SPARQL preconditions translate cleanly; SELECT-shaped preconditions are preserved as notes.")]
+    async fn onto_plan_compile_pddl(&self, Parameters(input): Parameters<OntoPlanCompilePddlInput>) -> String {
+        // Gather schemas — either explicitly requested or every registered one.
+        let names = if input.action_names.is_empty() {
+            match crate::dynamics::list_names(&self.db) {
+                Ok(n) => n,
+                Err(e) => return Self::err_json(e),
+            }
+        } else {
+            input.action_names
+        };
+        let mut schemas: Vec<crate::dynamics::ActionSchema> = Vec::with_capacity(names.len());
+        for n in &names {
+            match crate::dynamics::lookup(&self.db, n) {
+                Ok(Some(s)) => schemas.push(s),
+                Ok(None) => return Self::err_json(format!("unknown action: {}", n)),
+                Err(e) => return Self::err_json(e),
+            }
+        }
+
+        let domain_name = input.domain_name.unwrap_or_else(|| "ontology".to_string());
+        let compiled = crate::plan_pddl::compile_domain(&domain_name, &schemas);
+
+        // Init facts: enumerate every triple in the loaded graph as a (s, p, o).
+        let init_facts: Vec<(String, String, String)> = match self
+            .graph
+            .sparql_select("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10000")
+        {
+            Ok(s) => {
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+                v["results"].as_array().cloned().unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|row| {
+                        let s = row["s"].as_str()?.to_string();
+                        let p = row["p"].as_str()?.to_string();
+                        let o = row["o"].as_str()?.to_string();
+                        Some((s, p, o))
+                    })
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+
+        // Goal facts: parse goal_ttl by loading into a scratch graph.
+        let goal_facts: Vec<(String, String, String)> = match input.goal_ttl.as_deref() {
+            Some(ttl) if !ttl.trim().is_empty() => {
+                let temp = crate::graph::GraphStore::new();
+                if temp.load_turtle(ttl, None).is_err() {
+                    return r#"{"error":"goal_ttl failed to parse"}"#.to_string();
+                }
+                match temp.sparql_select("SELECT ?s ?p ?o WHERE { ?s ?p ?o }") {
+                    Ok(s) => {
+                        let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+                        v["results"].as_array().cloned().unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|row| {
+                                let s = row["s"].as_str()?.to_string();
+                                let p = row["p"].as_str()?.to_string();
+                                let o = row["o"].as_str()?.to_string();
+                                Some((s, p, o))
+                            })
+                            .collect()
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
+
+        let problem = crate::plan_pddl::compile_problem(
+            "ontology_problem",
+            &domain_name,
+            &init_facts,
+            &goal_facts,
+        );
+
+        let body = serde_json::json!({
+            "domain": compiled.domain,
+            "problem": problem,
+            "translation_notes": compiled.translation_notes,
+            "actions_included": names,
+            "init_facts_count": init_facts.len(),
+            "goal_facts_count": goal_facts.len(),
+        });
+        body.to_string()
+    }
+
+    #[tool(name = "onto_reason", description = "Run inference over the loaded ontology. Profiles: 'rdfs' (subclass, domain/range), 'owl-rl' (+ transitive/symmetric/inverse, sameAs, equivalentClass), 'owl-rl-ext' (+ someValuesFrom, allValuesFrom, hasValue, intersectionOf, unionOf), 'owl-dl' (SHIQ tableaux: satisfiability, classification, qualified number restrictions with node merging, inverse/symmetric roles, functional properties, parallel agent-based classification, explanation traces, ABox reasoning. Nominals are not implemented: owl:oneOf is not read and owl:hasValue is approximated as an atomic concept, so an ontology that uses either returns undetermined classes rather than a classification. Datatype ranges are skipped). Materializes inferred triples. Set `inference_graph` to keep them in a separate graph, where nothing downstream can read an inference as an assertion and a Turtle/RDF-XML save cannot publish one. Pass `rules_file` to evaluate a SUPPLIED Horn rule table instead of a built-in profile: it needs `certificate_dir`, materialises nothing, and writes a certificate the proved-sound Lean checker verifies with `lake exe oo-horn check`. The verdict comes from that checker and not from here, because rules you supply are assumed and never checked: a conclusion then holds in every model of the asserted graph that ALSO satisfies your rules. With `certificate_dir` the run ALSO looks for a contradiction in the closure it reached, and writes refutation.tsv when it finds one the Lean refutation checker can judge: `lake exe oo-refute check`, or `oo-refute guard` which refuses the derivation certificate over a graph it can refute. Seventeen OWL 2 RL rules conclude false, ten are detected here and exactly ONE, cax-dw, is certifiable, because OOCert.RefuteConditions carries a semantic condition for that rule alone. The other nine are reported as `clash_found_by_this_engine` with no file written, and that word is not the checker's `unsatisfiable_under_disjointness`: an engine opinion and a machine-checked result never share a string here. cax-dw needs an INDIVIDUAL in two disjoint classes, so a TBox unsatisfiable with no individual asserted is invisible to this route; profile 'owl-dl' sees that case and its answer carries no certificate. No clash found is never a consistency result. Every report carries `scope`, the graphs the run READ, and a certificate directory also gets `scope.tsv`: the Lean checkers verify the steps against the triples in asserted.tsv and cannot ask where those triples came from, so a certificate over one snapshot and a certificate over the union of every version are indistinguishable as files and only one is about a state that existed. Over a store that describes its named graphs with the temporal vocabulary (https://open-ontologies.org/temporal#), a run with no instant named is REFUSED: pass `valid_at`, `as_of` or `all_versions: true`. NO run over a versioned store materialises and it says so, whether scoped or `all_versions`: the default graph and an undescribed inference graph are both in scope at every instant, so a conclusion written to either becomes an axiom of every snapshot, and an `all_versions` closure was drawn from a state that held at no instant. Pass `materialize: false`. A scoped run also drops any graph holding this engine's own materialised inferences from what it reads, and records the drop. Scoped runs are not available for 'owl-dl'.")]
+    async fn onto_reason(&self, Parameters(input): Parameters<OntoReasonInput>) -> String {
+        use crate::reason::Reasoner;
+        // Resolved before anything else: which graphs a run reads decides what
+        // its answer is about, so a request that cannot be honoured is refused
+        // rather than carried into a run that then reports a scope it did not
+        // have.
+        let request = match crate::temporal::ScopeRequest::from_args(
+            input.valid_at.as_deref(),
+            input.as_of.as_deref(),
+            input.all_versions.unwrap_or(false),
+        ) {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(e),
+        };
+        // A supplied Horn rule table takes a different path: it is evaluated
+        // instead of a built-in profile, it materialises nothing, and the
+        // response carries no verdict, because a rule the caller wrote is an
+        // assumption and `oo-horn check` is what pronounces on a certificate
+        // over it. Anything the caller asked for that this path cannot honour
+        // is refused rather than ignored in silence.
+        if let Some(rules_file) = input.rules_file.as_deref() {
+            let Some(dir) = input.certificate_dir.as_deref() else {
+                return serde_json::json!({
+                    "error": "rules_file needs certificate_dir. A run over a supplied rule table \
+                              states no verdict of its own: the certificate is the output, and \
+                              `lake exe oo-horn check` is what pronounces on it"
+                })
+                .to_string();
+            };
+            if input.materialize == Some(true) || input.inference_graph == Some(true) {
+                return serde_json::json!({
+                    "error": "rules_file does not materialise. A conclusion drawn under a rule \
+                              table nobody has checked holds only in models that satisfy that \
+                              table, so it is not written into the store; drop materialize / \
+                              inference_graph to run it"
+                })
+                .to_string();
+            }
+            return Reasoner::run_horn_scoped(
+                &self.graph,
+                std::path::Path::new(rules_file),
+                std::path::Path::new(dir),
+                &request,
+            )
+            .unwrap_or_else(Self::err_json);
+        }
+        let profile = input.profile.as_deref().unwrap_or("rdfs");
+        let materialize = input.materialize.unwrap_or(true);
+        let target = if input.inference_graph.unwrap_or(false) {
+            crate::reason::InferenceTarget::Inferred
+        } else {
+            crate::reason::InferenceTarget::DefaultGraph
+        };
+        let dir = input.certificate_dir.as_deref().map(std::path::Path::new);
+        Reasoner::run_scoped(&self.graph, profile, materialize, target, dir, &request)
+            .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_justify", description = "AXIOM PINPOINTING: which ASSERTED triples are responsible for a conclusion, or for a contradiction. Returns the MINIMAL sets (justifications, MinAs), not a support set: a set that is not minimal blames axioms that had nothing to do with the conclusion, and an engineer who deletes one and watches the conclusion survive learns to distrust the tool. Pass `triple` for a conclusion or `inconsistency: true` for the clash, never both. Pass `candidate` to CHECK a set someone else produced instead of searching: it comes back `minimal_justification`, `not_a_justification_not_minimal` with the removable triples named, or `not_a_justification_target_not_reached`. THREE DIFFERENT THINGS ARE CLAIMED HERE AND THEY CARRY THREE DIFFERENT WORDS. Sufficiency is re-run and CAN be machine-checked: every justification was produced by running the engine over exactly that subset, and with `certificate_dir` the run is repeated with a certificate so `lake exe oo-cert` verifies under OOCert.certificate_sound that the subset really does entail the conclusion. Minimality is re-run and is NOT machine-checked: for every element of every justification the engine is run again without it and the conclusion must be gone, which is a property of this engine verified by execution and no theorem. Completeness of the LIST is an algorithm's claim: all justifications are enumerated by Reiter's hitting-set tree over the same oracle, bounded by max_justifications (default 16) and max_oracle_calls (default 400), and `truncated` says when a bound fired and which one. Reiter's construction is complete for a MONOTONE oracle and this engine has one non-monotone corner: a restriction node or list node carrying two values for a functional position contributes one, chosen by hash order, so where that occurs a justification can be MISSED. No justification returned can be wrong, because each was re-run. The first justification costs no re-run at all, because the derivation DAG already carries it; everything after that is one full fixpoint per node, which is the entire cost of this tool on a large ontology. For `inconsistency` the verdict explained is `clash_found_by_this_engine` and NEVER the Lean checker's `unsatisfiable_under_disjointness`: ten of the seventeen OWL 2 RL rules that conclude false are looked for, so no clash found is not a consistency result. A justification is a statement about THIS engine's rule table, 29 of OWL 2 RL's 78 rules. `owl-dl` is refused rather than answered emptily.")]
+    async fn onto_justify(&self, Parameters(input): Parameters<OntoJustifyInput>) -> String {
+        let mut opts = crate::justify::JustifyOptions {
+            profile: input.profile.unwrap_or_else(|| "owl-rl".to_string()),
+            ..Default::default()
+        };
+        if let Some(n) = input.max_justifications {
+            opts.max_justifications = n.max(1);
+        }
+        if let Some(n) = input.max_oracle_calls {
+            opts.max_oracle_calls = n.max(1);
+        }
+        opts.certificate_dir = input
+            .certificate_dir
+            .as_deref()
+            .map(|d| std::path::PathBuf::from(expand_tilde(d)));
+        crate::justify::justify(
+            &self.graph,
+            input.triple.as_deref(),
+            input.inconsistency.unwrap_or(false),
+            input.candidate.as_deref(),
+            &opts,
+        )
+        .map(|v| v.to_string())
+        .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_provenance", description = "PROVENANCE SEMIRINGS: the algebraic expression over the ASSERTED triples that a derived triple carries. Green, Karvounarakis and Tannen's construction applied to this engine's rule table, evaluated over the full derivation DAG rather than over `derivations.tsv`, which records only the FIRST derivation of each triple and would give one monomial wherever the closure supports several. Six semirings: `boolean` (derivability), `why` (sets of sets of asserted triples, absorptive, whose minimal elements are the justifications), `lineage` (Which(X): the union of everything that contributes, which is NOT a justification and is usually far from minimal), `counting` (the number of proof trees), `tropical` (min-plus: the cheapest proof tree, summing leaf weights with multiplicity) and `trust` (max-min: the confidence of the best derivation, which is the confidence of its weakest premise). RECURSION IS WHERE PROVENANCE GOES WRONG QUIETLY AND THIS TOOL DOES NOT. Datalog is recursive, so a triple whose support contains a cycle has arbitrarily many proof trees and its counting annotation DIVERGES. `why`, `trust` and `tropical` are absorptive and converge; `boolean` and `lineage` are NOT absorptive and converge for a different reason, which is that their value lattices are finite, and the payload says which reason applies to which. `counting` does not converge, so round k of the iteration counts proof trees of HEIGHT AT MOST k, `depth_bound` (default 32) is reported beside the number, `value_is_exact` is false unless the iteration stabilised on its own, and `cycle_in_support` names a triple on the cycle when there is one. A saturated 128-bit counter is reported as saturated rather than as a count. `why` is worst-case exponential, so `max_monomials` (default 64) caps it; the monomials KEPT are the smallest, which is what keeps the survivors an antichain, and a truncated run WITHDRAWS the claim that its monomials are minimal supports rather than keeping it. min-plus refuses a negative weight because it is absorptive only for non-negative ones; max-min refuses a weight above 1.0 because its multiplicative identity is 1 and a larger weight would make a conjunction come out smaller than the algebra says. NOTHING HERE IS MACHINE-CHECKED. The Lean layer certifies that a derivation step is sound; no theorem says a monomial is minimal or that the list of them is complete. onto_justify verifies a support set by re-running the engine without each of its elements; this tool does algebra. `owl-dl` is refused.")]
+    async fn onto_provenance(&self, Parameters(input): Parameters<OntoProvenanceInput>) -> String {
+        let semirings = match input.semirings {
+            None => crate::provenance::Semiring::all(),
+            Some(names) => {
+                let mut out = Vec::new();
+                for n in &names {
+                    match crate::provenance::Semiring::parse(n) {
+                        Some(s) => out.push(s),
+                        None => {
+                            return serde_json::json!({
+                                "error": format!(
+                                    "unknown semiring {n:?}. One of: boolean, why, lineage, \
+                                     counting, tropical (min-plus), trust (max-min). Refusing \
+                                     rather than silently computing the ones it recognised, \
+                                     because a report missing the semiring the caller asked for \
+                                     looks exactly like one where that semiring said nothing"
+                                )
+                            })
+                            .to_string();
+                        }
+                    }
+                }
+                out
+            }
+        };
+        let mut weights = std::collections::BTreeMap::new();
+        for w in input.weights.unwrap_or_default() {
+            match crate::provenance::parse_triple(&w.triple) {
+                Ok(t) => {
+                    weights.insert(t, w.weight);
+                }
+                Err(e) => return Self::err_json(e),
+            }
+        }
+        let opts = crate::provenance::ProvenanceOptions {
+            profile: input.profile.unwrap_or_else(|| "owl-rl".to_string()),
+            semirings,
+            depth_bound: input
+                .depth_bound
+                .unwrap_or(crate::provenance::DEFAULT_DEPTH_BOUND)
+                .max(1),
+            max_monomials: input
+                .max_monomials
+                .unwrap_or(crate::provenance::DEFAULT_MAX_MONOMIALS)
+                .max(1),
+            weights,
+        };
+        crate::provenance::annotate(&self.graph, input.triple.as_deref(), &opts)
+            .map(|v| v.to_string())
+            .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_fol_export", description = "Export the loaded ontology as first-order logic, so it can be handed to the automated-theorem-proving ecosystem. FOUR syntaxes over ONE translation: `tptp` (FOF, what E, Vampire and every other first-order prover read), `clif` (ISO/IEC 24707 Common Logic Interchange Format, restricted to the first-order-equivalent fragment: no sequence markers, fixed arity, no quantification into a predicate position), `smtlib` (SMT-LIB 2, what Z3 reads) and `ladr` (what Mace4 reads, with every symbol MANGLED and the table written beside it as symbols.tsv, because LADR reads a name beginning with u, v, w, x, y or z as a VARIABLE and has no quoting construct that survives an IRI). The last two are read by MODEL FINDERS, so they assert the NEGATED goal rather than declaring a conjecture: a countermodel to `G |= phi` is a model of `G + {not phi}`. With `smtlib`, omit `smt_domain` for the UNBOUNDED encoding, where `unsat` really is unsatisfiability, or set it to k for an enumeration carrier of exactly k elements, where a `sat` comes with a structure `oo-folmodel` can CHECK and an `unsat` establishes only that no model of size k exists. Every run also writes `problem.tsv`, the checker's own format, with its digest, so a solver result can be handed to `oo-folmodel` without going back through the engine; use onto_fol_model to do all of that in one call. The translation is the one a MACHINE-CHECKED ADEQUACY THEOREM is about: `OwlLean.adequacy` in the sibling owl-lean project, axioms propext + Classical.choice + Quot.sound, no sorry, no Mathlib. That theorem is why the emitted file means what it says. THE CORRESPONDENCE BETWEEN THIS EMITTER AND THAT LEAN IS PINNED BY TESTS AND IS NOT ITSELF PROVED. The output includes the background axioms (the two domains are disjoint, the object domain is non-empty) and the individual typing axioms `thing(a)`, whose ABSENCE REFUTES ADEQUACY OUTRIGHT (OwlLean.Refutations.adequacy_needs_ind_axioms). Constructs outside the fragment are NOT dropped silently: `exports_a_weaker_axiom_set` and `constructs_not_exported` name every one with its count and the reason, and `reduced_to_fragment` names every construct rewritten before translation. Pass `goals_file` (a TSV of triples, e.g. the `derivations.tsv` from onto_reason with certificate_dir, with goals_skip_columns=1) to also write one problem per conjecture. A PROVER'S VERDICT ON THESE FILES IS AN ORACLE OPINION UNLESS onto_fol_prove CERTIFIES IT: a refutation of a problem in the clausal fragment (every OWL 2 RL ontology is) is translated into lean/Fo's certificate format and checked by oo-resolution, Fo.unsat_of_check; a refutation that uses equality or falls outside that fragment stays an opinion, because lean/Fo has no equality yet (decision 0005, second addendum). Use tools/fol_differential.py, which reports disagreement between this engine and an ATP and does not adjudicate it.")]
+    async fn onto_fol_export(&self, Parameters(input): Parameters<OntoFolExportInput>) -> String {
+        let syntax = match crate::tptp::Syntax::parse(
+            input.format.as_deref().unwrap_or("tptp"),
+            input.clif_dialect.as_deref(),
+            input.clif_comments.as_deref(),
+            input.smt_domain,
+        ) {
+            Ok(s) => s,
+            Err(e) => return Self::err_json(e),
+        };
+        crate::tptp::export(
+            &self.graph,
+            std::path::Path::new(&input.out_dir),
+            syntax,
+            input.goals_file.as_deref().map(std::path::Path::new),
+            input.goals_skip_columns.unwrap_or(0),
+        )
+        .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_rules_import", description = "Read rules written in a STANDARD rule syntax into the Horn rule table `onto_reason` evaluates with `rules_file` and the proved-sound Lean checker verifies with `lake exe oo-horn check`. `from: \"swrl\"` reads SWRL rules encoded in RDF (swrl:Imp with swrl:body / swrl:head as rdf:List atom lists) out of the loaded graph, or out of `file` if one is given. `from: \"rif\"` reads RIF Core in its normative XML syntax from `file`; the presentation syntax is NOT parsed and is refused rather than half-read. ONLY PART OF EACH LANGUAGE IS A HORN TABLE OVER TRIPLE PATTERNS. SWRL built-in atoms (swrlb: arithmetic and string predicates), swrl:SameIndividualAtom, swrl:DifferentIndividualsAtom, swrl:DataRangeAtom and anonymous class expressions are refused; RIF equality, External functions and predicates, Expr terms, rif:local constants, List terms, Or/Neg/Naf, an existential conclusion and an Atom of arity 0 or 3+ are refused. A refused rule is NAMED AND COUNTED and by default fails the whole import with no table written, because a rule set that quietly lost half its rules still reaches a fixpoint and still produces a certificate that checks green, which is a sound proof about a rule set nobody wrote. `allow_partial: true` imports the rest anyway and flags the result `certifies_a_weaker_rule_set`. Every rule imported is a rule YOU wrote and nothing discharges it, so a certificate over the table can only ever earn `entailed_under_supplied_rules` under `OOCert.horn_certificate_sound`: true in every model of the asserted graph THAT ALSO SATISFIES YOUR RULES. This tool states no verdict; `oo-horn check` is what pronounces.")]
+    fn onto_rules_import(&self, Parameters(input): Parameters<OntoRulesImportInput>) -> String {
+        crate::rulesyntax::run_import(
+            &self.graph,
+            &input.from,
+            input.file.as_deref().map(std::path::Path::new),
+            input.out.as_deref().map(std::path::Path::new),
+            input.allow_partial.unwrap_or(false),
+        )
+        .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_fol_model", description = "Find a finite model of the loaded ontology and CHECK IT, so the answer names what it rests on. This is the SAT/SMT family, and it is deliberately not symmetric. A REFUTATION cannot be replayed in core Lean, so a solver saying `unsat` is an ORACLE OPINION for ever (decision 0005). A MODEL is a finite object, checking a formula against it is decidable, and `lean/Fol/` holds a checker whose soundness is machine-checked: `Fol.satisfiable_of_check` turns an accepted structure into satisfiability of exactly the formulas it was checked against, and `Fol.not_entails_of_check` turns a checked model of the NEGATED goal into a machine-checked NON-ENTAILMENT, which is the one sentence no theorem prover can produce. The pipeline exports SMT-LIB 2 (for Z3) or LADR (for Mace4) and `problem.tsv` from ONE representation, climbs a cardinality ladder, reads the structure back, and runs `oo-folmodel`. FIVE FIELDS THAT ARE NEVER COLLAPSED: `solver_verdict` (sat/unsat/unknown, what the oracle said), `encoding` (unbounded or finite(k), what it was asked), `checker_exit` (null means the checker never ran), `verdict`, and `owl_reading`. The verdict is one of FIVE WORDS: `model_checked` is the ONLY certified one and requires checker_exit 0; `satisfiable_oracle` is sat with nothing checked; `no_model_up_to_size_k` is an exhausted BOUNDED search and IS NOT UNSATISFIABILITY (a theory with no model of size k can have one of size k+1, and SHIQ has no finite model property at all, so a satisfiable ontology can have only infinite models and will never receive a certificate here); `unsatisfiable_oracle` may be produced ONLY by a run with no cardinality constraint of any kind and can never be more than an opinion; `unknown_oracle` is a timeout or a give-up. A solver answering sat whose model the checker REJECTS is a STOP-THE-LINE disagreement reported in its own block with severity STOP_THE_LINE, never `rejected` as though the ontology were at fault and never `model_checked`. The OWL-level reading carries its own word, `not_entailed_under_unproved_translation`, because it rides on OwlLean.adequacy in a sibling project AND on the Rust-to-Lean correspondence that is PINNED BY TESTS AND NOT PROVED. Needs z3 or mace4 on PATH and `oo-folmodel` built (cd lean && lake build); the absence of either is reported loudly in `skipped` and never worked around. A construct the reader cannot translate makes the export WEAKER than the ontology, and a model of a weaker theory is not a model of the ontology: `exports_a_weaker_axiom_set` and `constructs_not_exported` name every dropped construct, `owl_reading` is withheld, and `transfers_to_the_ontology` is false for `model_checked` and `satisfiable_oracle` (the unsatisfiable-direction verdicts still carry over). See docs/decisions/0006.")]
+    async fn onto_fol_model(&self, Parameters(input): Parameters<OntoFolModelInput>) -> String {
+        use crate::fol_solve::{SolveOptions, Solver, solve_export};
+        let solver = match Solver::parse(input.solver.as_deref().unwrap_or("z3")) {
+            Ok(s) => s,
+            Err(e) => return Self::err_json(e),
+        };
+        let opts = SolveOptions {
+            solver,
+            max_domain: input.max_domain.unwrap_or(16),
+            timeout_secs: input.timeout_secs.unwrap_or(30),
+            unbounded_probe: input.unbounded_probe.unwrap_or(true),
+            checker: None,
+        };
+        solve_export(
+            &self.graph,
+            std::path::Path::new(&input.out_dir),
+            &opts,
+            input.goals_file.as_deref().map(std::path::Path::new),
+            input.goals_skip_columns.unwrap_or(0),
+        )
+        .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_fol_prove", description = "Run a first-order prover, READ the derivation it prints back, and RE-CHECK what can honestly be re-checked. This moves the boundary decision 0005 drew by exactly one step, its second addendum: a refutation of a problem in the clausal fragment is CERTIFIED when lean/Fo's checker accepts its translation (`refutation_certified`, theorem Fo.unsat_of_check, no user action: OWL 2 RL goes to the prover as clauses by itself), and every other refutation is an ORACLE OPINION, because lean/Fo has no equality yet and the replayer here is ordinary UNVERIFIED Rust with no theorem behind it. What it adds is that the opinion stops being a single word. THREE THINGS ARE EARNED, in increasing cost: (1) THE PROVER REFUTED OUR PROBLEM: every leaf of the derivation is matched, by name AND by parsed formula AND by role, against the problem onto_fol_export emitted, so a prover pointed at a stale file, a different file, or one whose conjecture was smuggled in as an axiom is caught; (2) THE DERIVATION IS A WELL-FOUNDED DAG ENDING IN $false: every parent reference resolves, the parent relation is acyclic, and the node nothing cites is the empty clause; (3) SOME STEPS ARE REPLAYED: binary resolution (which is also exactly what a subsumption-resolution conclusion is), factoring, duplicate literal removal, trivial inequality removal, equality resolution, associative flattening and the negation of the conjecture are recomputed from their premises with a small unifier. EVERYTHING ELSE IS NAMED AND COUNTED AS UNCHECKED: clausification, Skolemisation, AVATAR splitting and every SAT-solver step are not checked and are never claimed to be. FIELDS THAT ARE NEVER COLLAPSED: `szs_status` (what the prover said about itself, echoed and untrusted), `derivation_wellformed`, `leaves_match_problem` with `leaf_match_levels` saying how much normalisation each leaf needed, `steps_checked` / `steps_unchecked` (by rule, with a count and a reason) / `steps_not_reconstructed`, `conjecture_used`, `what_was_refuted` (`axioms_and_the_negated_conjecture` or `axioms_alone`, the second meaning the axioms are inconsistent on their own), and `verdict`. THE VERDICT IS ONE OF TEN WORDS: `derivation_rejected` is THE CHECKER SAYING NO (a dangling parent, a cycle, or a leaf that is not a formula of the problem); `refutation_step_not_reconstructed` means a step whose rule IS implemented did not reconstruct, which is EITHER a defect in the derivation OR a gap in this checker and this tool decides neither; `refutation_structure_checked`, `refutation_partially_replayed` and `refutation_fully_replayed` are the replay ladder, AN UNCHECKED STEP PREVENTS THE STRONGEST WORD, and even the strongest is NOT `unsatisfiable` and NOT a Lean-checked anything; `no_refutation_offered`, `derivation_unparsed` and `problem_unparsed` are the non-answers; `refutation_certified` is the one word that rests on a theorem, set only when a Certified token was minted by oo-resolution accepting the translated derivation; and `mu` is a question returned UNASKED, because it puts in class position a term the ontology never uses as a class (undeclared, or only ever an individual, or a skos:Concept), so neither yes nor no would be about anything and no prover is asked. Needs vampire or eprover on PATH; its absence is reported loudly in `skipped` and never worked around. Pass `problem` and `proof` to check a recorded pair with no prover run and no store. The MODEL direction is the one that CAN be certified: see onto_fol_model and decision 0006.")]
+    async fn onto_fol_prove(&self, Parameters(input): Parameters<OntoFolProveInput>) -> String {
+        use crate::tstp::{ProveOptions, Prover, check_files, prove_export};
+        if let (Some(p), Some(d)) = (input.problem.as_deref(), input.proof.as_deref()) {
+            return check_files(std::path::Path::new(p), std::path::Path::new(d))
+                .unwrap_or_else(Self::err_json);
+        }
+        let Some(out_dir) = input.out_dir.as_deref() else {
+            return serde_json::json!({
+                "error": "onto_fol_prove needs out_dir, or `problem` with `proof` to check a \
+                          recorded pair"
+            })
+            .to_string();
+        };
+        let prover = match Prover::parse(input.prover.as_deref().unwrap_or("vampire")) {
+            Ok(p) => p,
+            Err(e) => return Self::err_json(e),
+        };
+        let opts = ProveOptions { prover, timeout_secs: input.timeout_secs.unwrap_or(30) };
+        prove_export(
+            &self.graph,
+            std::path::Path::new(out_dir),
+            &opts,
+            input.goals_file.as_deref().map(std::path::Path::new),
+            input.goals_skip_columns.unwrap_or(0),
+        )
+        .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_dl_explain", description = "Explain why a class is unsatisfiable using DL tableaux reasoning. Returns an explanation trace showing the logical contradictions that make the class impossible to instantiate.")]
+    async fn onto_dl_explain(&self, Parameters(input): Parameters<OntoDlExplainInput>) -> String {
+        use crate::tableaux::DlReasoner;
+        DlReasoner::explain_class(&self.graph, &input.class_iri)
+            .unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_dl_check", description = "Check if one class is subsumed by another using DL tableaux reasoning. Returns whether sub_class is a subclass of super_class, with justification.")]
+    async fn onto_dl_check(&self, Parameters(input): Parameters<OntoDlCheckInput>) -> String {
+        use crate::tableaux::DlReasoner;
+        DlReasoner::check_subsumption(&self.graph, &input.sub_class, &input.super_class)
+            .unwrap_or_else(Self::err_json)
+    }
+
+    // ── v2: Lifecycle tools ─────────────────────────────────────────────────
+
+    #[tool(name = "onto_plan", description = "Terraform-style plan: diff current store against proposed Turtle. Shows added/removed classes/properties, blast radius, risk score, and locked IRI violations. All of that is about SHAPE. Pass check_conservativity=true for the one part that is about MEANING: whether the change alters any consequence over the names the store already uses, under the rule table in conservativity_profile. That is the check a shape diff cannot do — adding one rdfs:domain reclassifies every existing individual of that property while adding no class and removing nothing, so every other number in the plan stays green. It reasons both graphs to a fixpoint, so it is opt-in; when it is off the plan says so under `conservativity` rather than staying silent. Read the honesty note in onto_conservative_check before acting on the verdict: it is conservativity under a Horn rule table, not in a description logic.")]
+    pub async fn onto_plan(&self, Parameters(input): Parameters<OntoPlanInput>) -> String {
+        let planner = crate::plan::Planner::with_owner(
+            self.db.clone(),
+            self.graph.clone(),
+            &self.session_id,
+        );
+        // `onto_plan` receives the WHOLE proposed graph, so the mode is fixed
+        // here rather than exposed: reading a replacement as a delta would
+        // report a change that deletes half the ontology as an extension.
+        // DEFAULT ON, changed under #196.
+        //
+        // It was opt-in because it reasons both graphs to a fixpoint, and that
+        // is a real cost. Measured on this machine, adding one `rdfs:domain`
+        // triple to a store of N individuals of that property: 900 in 0.14s,
+        // 9,000 in 0.68s, 45,000 in 3.99s. Roughly linear, about 11
+        // microseconds an individual.
+        //
+        // A plan is a deliberate pre-production act, not an interactive query,
+        // and that cost buys the only part of a plan that is about MEANING. In
+        // the run above every shape number stayed at zero — no class added,
+        // none removed, blast radius zero, risk low — while 901 consequences
+        // appeared that were not there before. A safety check that is off by
+        // default is one most users never learn exists, and this one is the
+        // reason to use a plan at all.
+        //
+        // `check_conservativity: false` opts out, and is the thing to reach for
+        // on a store big enough that the fixpoint hurts.
+        let conservativity = input.check_conservativity.unwrap_or(true).then(|| {
+            crate::conservativity::ConservativityOptions {
+                mode: crate::conservativity::ExtensionMode::Replacement,
+                profile: input.conservativity_profile.unwrap_or_else(|| "owl-rl".to_string()),
+                out: input
+                    .conservativity_out_dir
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        // Per CALL, not per process. Two plans running at once
+                        // in one server would otherwise write their two
+                        // certificates into the same directory and each read
+                        // the other's.
+                        std::env::temp_dir().join(format!(
+                            "oo-plan-conservativity-{}-{:016x}",
+                            std::process::id(),
+                            crate::lineage::rand_id()
+                        ))
+                    }),
+                ..Default::default()
+            }
+        });
+        match planner.plan_checked(&input.new_turtle, conservativity) {
+            Ok(result) => {
+                self.lineage().record(&self.session_id, "P", "plan", "computed");
+                result
+            }
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_apply", description = "Apply a plan produced by onto_plan, defaulting to the most recent one. Pass plan_id to target a specific plan. Modes: 'safe' (clear+reload, checks monitor), 'force' (ignores monitor), 'migrate' (adds owl:equivalentClass/Property bridges for renames).")]
+    pub async fn onto_apply(&self, Parameters(input): Parameters<OntoApplyInput>) -> String {
+        let mode = input.mode.as_deref().unwrap_or("safe");
+        let planner = crate::plan::Planner::with_owner(
+            self.db.clone(),
+            self.graph.clone(),
+            &self.session_id,
+        );
+        match planner.apply_plan(input.plan_id.as_deref(), mode) {
+            Ok(result) => {
+                self.lineage().record(&self.session_id, "A", "apply", mode);
+                let monitor_result = self.monitor().run_watchers();
+                if monitor_result.status != "ok" {
+                    let mut parsed: serde_json::Value = serde_json::from_str(&result).unwrap_or_default();
+                    parsed["monitor"] = serde_json::to_value(&monitor_result).unwrap_or_default();
+                    return parsed.to_string();
+                }
+                result
+            }
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_lock", description = "Lock IRIs to prevent removal during plan/apply. Locked IRIs will show as violations in plan output.")]
+    async fn onto_lock(&self, Parameters(input): Parameters<OntoLockInput>) -> String {
+        let planner = crate::plan::Planner::new(self.db.clone(), self.graph.clone());
+        let reason = input.reason.as_deref().unwrap_or("locked");
+        for iri in &input.iris {
+            planner.lock_iri(iri, reason);
+        }
+        serde_json::json!({
+            "ok": true,
+            "locked": input.iris,
+            "reason": reason,
+        }).to_string()
+    }
+
+    #[tool(name = "onto_drift", description = "Detect drift between two ontology versions. Returns added/removed terms, likely renames with confidence scores, and drift velocity. `format` selects output: 'json' (default), 'kgcl' (KGCL CNL text), or 'kgcl_json' (KGCL structured JSON-LD).")]
+    async fn onto_drift(&self, Parameters(input): Parameters<OntoDriftInput>) -> String {
+        let detector = crate::drift::DriftDetector::new(self.db.clone());
+        let format = input.format.as_deref().unwrap_or("json");
+        let threshold = input.rename_threshold.unwrap_or(0.7);
+        match format {
+            "kgcl" => match detector.detect_kgcl(&input.version_a, &input.version_b, threshold) {
+                Ok(report) if report.approximate_reason.is_some() => Self::err_json(anyhow::anyhow!(
+                    "the drift is approximate and KGCL CNL cannot say so; use format 'json' or \
+                     'kgcl_json', which carry `exact: false` and the reason: {}",
+                    report.approximate_reason.unwrap_or_default()
+                )),
+                Ok(report) => {
+                    self.lineage()
+                        .record(&self.session_id, "D", "drift", "detected:kgcl");
+                    report.to_cnl()
+                }
+                Err(e) => Self::err_json(e),
+            },
+            "kgcl_json" => match detector.detect_kgcl(&input.version_a, &input.version_b, threshold) {
+                Ok(report) => {
+                    self.lineage()
+                        .record(&self.session_id, "D", "drift", "detected:kgcl_json");
+                    report.to_json().to_string()
+                }
+                Err(e) => Self::err_json(e),
+            },
+            _ => match detector.detect(&input.version_a, &input.version_b) {
+                Ok(result) => {
+                    self.lineage().record(&self.session_id, "D", "drift", "detected");
+                    result
+                }
+                Err(e) => Self::err_json(e),
+            },
+        }
+    }
+
+    #[tool(name = "onto_enforce", description = "Enforce design patterns on the loaded ontology. Built-in packs: 'generic' (orphan classes, missing domain/range/label), 'boro' (BORO 4D patterns), 'value_partition' (disjoint/covering checks). Also runs any custom rules stored for the pack.")]
+    async fn onto_enforce(&self, Parameters(input): Parameters<OntoEnforceInput>) -> String {
+        let enforcer = crate::enforce::Enforcer::new(self.db.clone(), self.graph.clone());
+        match enforcer.enforce_with_feedback(&input.rule_pack, Some(&self.db)) {
+            Ok(result) => {
+                self.lineage().record(&self.session_id, "E", "enforce", &input.rule_pack);
+                result
+            }
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_monitor", description = "Run active monitoring watchers. Optionally add new watchers via inline JSON. Watchers with action=notify and a webhook_url will POST alerts to the URL. Returns ok/alert/blocked status with details.")]
+    async fn onto_monitor(&self, Parameters(input): Parameters<OntoMonitorInput>) -> String {
+        let monitor = self.monitor();
+
+        // Add watchers if provided
+        if let Some(ref watchers_json) = input.watchers
+            && let Ok(watchers) = serde_json::from_str::<Vec<crate::monitor::Watcher>>(watchers_json) {
+                for w in watchers {
+                    monitor.add_watcher(w);
+                }
+            }
+
+        let result = monitor.run_watchers();
+        self.lineage().record(&self.session_id, "M", "monitor", &result.status);
+        serde_json::to_string(&result).unwrap_or_else(Self::err_json)
+    }
+
+    #[tool(name = "onto_monitor_clear", description = "Clear the monitor blocked flag, allowing apply operations to proceed.")]
+    fn onto_monitor_clear(&self) -> String {
+        self.monitor().clear_blocked();
+        r#"{"ok":true,"message":"Monitor block cleared"}"#.to_string()
+    }
+
+    #[tool(name = "onto_crosswalk", description = "Look up clinical crosswalk mappings for a code and system (ICD10, SNOMED, MeSH). Uses data/crosswalks.parquet (93-row sample included; run scripts/build_crosswalks.py to extend).")]
+    async fn onto_crosswalk(&self, Parameters(input): Parameters<OntoCrosswalkInput>) -> String {
+        match crate::clinical::ClinicalCrosswalks::load("data/crosswalks.parquet") {
+            Ok(cw) => {
+                let results = cw.lookup(&input.code, &input.source_system);
+                serde_json::json!({
+                    "code": input.code,
+                    "system": input.source_system,
+                    "mappings": results.iter().map(|r| serde_json::json!({
+                        "target_code": r.target_code,
+                        "target_system": r.target_system,
+                        "relation": r.relation,
+                        "source_label": r.source_label,
+                        "target_label": r.target_label,
+                    })).collect::<Vec<_>>(),
+                }).to_string()
+            }
+            Err(e) => Self::err_json(format!("Crosswalks not loaded: {}. Run scripts/build_crosswalks.py first.", e)),
+        }
+    }
+
+    #[tool(name = "onto_enrich", description = "Enrich an ontology class with a SKOS mapping triple from the clinical crosswalks.")]
+    async fn onto_enrich(&self, Parameters(input): Parameters<OntoEnrichInput>) -> String {
+        match crate::clinical::ClinicalCrosswalks::load("data/crosswalks.parquet") {
+            Ok(cw) => cw.enrich(&self.graph, &input.class_iri, &input.code, &input.system),
+            Err(e) => Self::err_json(format!("Crosswalks not loaded: {}", e)),
+        }
+    }
+
+    #[tool(name = "onto_validate_clinical", description = "Validate all class labels in the loaded ontology against clinical crosswalk data. Shows which terms match known clinical codes.")]
+    fn onto_validate_clinical(&self) -> String {
+        match crate::clinical::ClinicalCrosswalks::load("data/crosswalks.parquet") {
+            Ok(cw) => cw.validate_clinical(&self.graph),
+            Err(e) => Self::err_json(format!("Crosswalks not loaded: {}", e)),
+        }
+    }
+
+    #[tool(name = "onto_lineage", description = "Get the compact lineage log for the current or specified session.")]
+    async fn onto_lineage(&self, Parameters(input): Parameters<OntoLineageInput>) -> String {
+        let session = input.session_id.as_deref().unwrap_or(&self.session_id);
+        let events = self.lineage().get_compact(session);
+        serde_json::json!({
+            "session_id": session,
+            "events": events.trim(),
+        }).to_string()
+    }
+
+    #[tool(name = "onto_extend", description = "Convenience pipeline: ingest data → validate with SHACL → run OWL reasoning, all in one call. Combines onto_ingest + onto_shacl + onto_reason. It takes no temporal scope arguments and inherits the refusal from the two tools it chains: over a store that describes its named graphs with the temporal vocabulary (https://open-ontologies.org/temporal#), this returns the error rather than a pipeline report, and the snapshot has to be run through onto_shacl and onto_reason directly with valid_at / as_of.")]
+    async fn onto_extend(&self, Parameters(input): Parameters<OntoExtendInput>) -> String {
+        use crate::ingest::DataIngester;
+        use crate::mapping::MappingConfig;
+        use crate::shacl::ShaclValidator;
+        use crate::reason::Reasoner;
+
+        let base_iri = input.base_iri.as_deref().unwrap_or("http://example.org/data/");
+
+        // 1. Ingest
+        let rows = match DataIngester::parse_file(&input.data_path) {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(format!("Ingest failed: {}", e)),
+        };
+
+        let mapping = if let Some(ref mapping_str) = input.mapping {
+            if input.inline_mapping.unwrap_or(false) {
+                match serde_json::from_str::<MappingConfig>(mapping_str) {
+                    Ok(m) => m,
+                    Err(e) => return Self::err_json(format!("Invalid mapping: {}", e)),
+                }
+            } else {
+                match std::fs::read_to_string(mapping_str) {
+                    Ok(content) => match serde_json::from_str::<MappingConfig>(&content) {
+                        Ok(m) => m,
+                        Err(e) => return Self::err_json(format!("Invalid mapping file: {}", e)),
+                    },
+                    Err(e) => return Self::err_json(format!("Cannot read mapping: {}", e)),
+                }
+            }
+        } else {
+            let headers = DataIngester::extract_headers(&rows);
+            MappingConfig::from_headers(&headers, base_iri, &format!("{}Thing", base_iri))
+        };
+
+        let ntriples = mapping.rows_to_ntriples(&rows);
+        let triples_loaded = match self.graph.load_ntriples(&ntriples) {
+            Ok(c) => c,
+            Err(e) => return Self::err_json(format!("Failed to load triples: {}", e)),
+        };
+
+        // 2. SHACL (optional)
+        let mut shacl_result = serde_json::json!({"skipped": true});
+        if let Some(ref shapes_input) = input.shapes {
+            let shapes = if input.inline_shapes.unwrap_or(false) {
+                shapes_input.clone()
+            } else {
+                match std::fs::read_to_string(shapes_input) {
+                    Ok(c) => c,
+                    Err(e) => return Self::err_json(format!("Cannot read shapes: {}", e)),
+                }
+            };
+            match ShaclValidator::validate(&self.graph, &shapes) {
+                Ok(report) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&report) {
+                        let stop = input.stop_on_violations.unwrap_or(true);
+                        if stop && parsed["conforms"] == false {
+                            return serde_json::json!({
+                                "stage": "shacl",
+                                "triples_ingested": triples_loaded,
+                                "shacl": parsed,
+                                "stopped": true,
+                                "message": "Pipeline stopped due to SHACL violations",
+                            }).to_string();
+                        }
+                        shacl_result = parsed;
+                    }
+                }
+                Err(e) => return Self::err_json(format!("SHACL validation failed: {}", e)),
+            }
+        }
+
+        // 3. Reasoning (optional)
+        let mut reason_result = serde_json::json!({"skipped": true});
+        if let Some(ref profile) = input.reason_profile {
+            match Reasoner::run(&self.graph, profile, true) {
+                Ok(report) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&report) {
+                        reason_result = parsed;
+                    }
+                }
+                Err(e) => return Self::err_json(format!("Reasoning failed: {}", e)),
+            }
+        }
+
+        serde_json::json!({
+            "ok": true,
+            "triples_ingested": triples_loaded,
+            "rows_processed": rows.len(),
+            "shacl": shacl_result,
+            "reasoning": reason_result,
+        }).to_string()
+    }
+
+    #[tool(name = "onto_import_schema", description = "Import a relational database schema as an OWL ontology. Supports PostgreSQL (postgres://…) and DuckDB (duckdb:///path.duckdb, :memory:, or *.duckdb file path). Introspects tables, columns, primary keys, and foreign keys, then generates OWL classes, datatype/object properties, and cardinality restrictions.")]
+    #[allow(unreachable_code, unused_variables, unused_assignments)]
+    async fn onto_import_schema(&self, Parameters(input): Parameters<OntoImportSchemaInput>) -> String {
+        use crate::schema::SchemaIntrospector;
+        use crate::sqlsource;
+
+        let base_iri = input.base_iri.as_deref().unwrap_or("http://example.org/db/");
+
+        // Dispatch by connection-string scheme. Both backbones land in the
+        // same OWL generator so the downstream pipeline (validate + load)
+        // is identical.
+        let driver = match sqlsource::detect_driver(&input.connection) {
+            Ok(d) => d,
+            Err(e) => return Self::err_json(e),
+        };
+
+        let tables: Vec<crate::schema::TableInfo> = match driver {
+            crate::sqlsource::SqlDriver::Postgres => {
+                #[cfg(feature = "postgres")]
+                {
+                    match SchemaIntrospector::introspect_postgres(&input.connection).await {
+                        Ok(t) => t,
+                        Err(e) => return Self::err_json(format!("Postgres connection failed: {}", e)),
+                    }
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    return r#"{"error":"Compiled without postgres feature. Rebuild with --features postgres"}"#.to_string();
+                }
+            }
+            crate::sqlsource::SqlDriver::DuckDb => {
+                #[cfg(feature = "duckdb")]
+                {
+                    let target = sqlsource::duckdb_target(&input.connection);
+                    // DuckDB introspection is sync; offload to blocking pool.
+                    match tokio::task::spawn_blocking(move || {
+                        SchemaIntrospector::introspect_duckdb(&target)
+                    })
+                    .await
+                    {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(e)) => return Self::err_json(format!("DuckDB introspection failed: {}", e)),
+                        Err(e) => return Self::err_json(format!("DuckDB worker panicked: {}", e)),
+                    }
+                }
+                #[cfg(not(feature = "duckdb"))]
+                {
+                    return r#"{"error":"Compiled without duckdb feature. Rebuild with --features duckdb"}"#.to_string();
+                }
+            }
+        };
+
+        let turtle = SchemaIntrospector::generate_turtle(&tables, base_iri);
+
+        // Validate + load
+        if let Err(e) = GraphStore::validate_turtle(&turtle) {
+            return Self::err_json(format!("Generated Turtle invalid: {}", e));
+        }
+
+        match self.graph.load_turtle(&turtle, Some(base_iri)) {
+            Ok(count) => serde_json::json!({
+                "ok": true,
+                "driver": driver.as_str(),
+                "tables": tables.len(),
+                "classes": tables.len(),
+                "triples": count,
+                "base_iri": base_iri,
+            }).to_string(),
+            Err(e) => Self::err_json(format!("Failed to load: {}", e)),
+        }
+    }
+
+    #[tool(name = "onto_sql_ingest", description = "Run a SQL query against a relational backbone (PostgreSQL or DuckDB) and ingest the resulting rows into the triple store as RDF. DuckDB is recommended as a federation layer: with its httpfs/parquet/csv/postgres_scanner extensions one query can union remote files, object stores, and other databases. The mapping config has the same shape as onto_ingest.")]
+    async fn onto_sql_ingest(&self, Parameters(input): Parameters<OntoSqlIngestInput>) -> String {
+        use crate::ingest::DataIngester;
+        use crate::mapping::MappingConfig;
+        use crate::sqlsource;
+
+        let base_iri = input.base_iri.as_deref().unwrap_or("http://example.org/data/");
+
+        // Validate connection scheme up front so we fail fast with a clear error.
+        let driver = match sqlsource::detect_driver(&input.connection) {
+            Ok(d) => d,
+            Err(e) => return Self::err_json(e),
+        };
+
+        let rows = match sqlsource::query_rows(&input.connection, &input.sql).await {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(format!("SQL query failed: {}", e)),
+        };
+
+        if rows.is_empty() {
+            return serde_json::json!({
+                "ok": true,
+                "driver": driver.as_str(),
+                "triples_loaded": 0,
+                "rows_processed": 0,
+                "warnings": ["Query returned no rows"],
+            })
+            .to_string();
+        }
+
+        // Resolve mapping (inline JSON / file path / auto from columns).
+        let mapping = if let Some(ref mapping_str) = input.mapping {
+            if input.inline_mapping.unwrap_or(false) {
+                match serde_json::from_str::<MappingConfig>(mapping_str) {
+                    Ok(m) => m,
+                    Err(e) => return Self::err_json(format!("Invalid mapping JSON: {}", e)),
+                }
+            } else {
+                match std::fs::read_to_string(mapping_str) {
+                    Ok(content) => match serde_json::from_str::<MappingConfig>(&content) {
+                        Ok(m) => m,
+                        Err(e) => return Self::err_json(format!("Invalid mapping file: {}", e)),
+                    },
+                    Err(e) => return Self::err_json(format!("Cannot read mapping file: {}", e)),
+                }
+            }
+        } else {
+            let headers = DataIngester::extract_headers(&rows);
+            MappingConfig::from_headers(&headers, base_iri, &format!("{}Thing", base_iri))
+        };
+
+        let ntriples = mapping.rows_to_ntriples(&rows);
+        let load_result = self.graph.load_ntriples(&ntriples);
+        let count = match load_result {
+            Ok(c) => c,
+            Err(e) => return Self::err_json(format!("Failed to load triples: {}", e)),
+        };
+
+        // CDC: record new watermark if caller asked us to track one.
+        let cdc_summary = match (&input.sync_key, &input.watermark_column) {
+            (Some(key), Some(col)) => {
+                match crate::sql_sync::extract_max_watermark(&rows, col) {
+                    Some(wm) => match crate::sql_sync::set_watermark(
+                        &self.db, key, &wm, Some(col), rows.len() as u64,
+                    ) {
+                        Ok(()) => Some(serde_json::json!({
+                            "sync_key": key,
+                            "new_watermark": wm,
+                            "watermark_column": col,
+                        })),
+                        Err(e) => Some(serde_json::json!({
+                            "sync_key": key,
+                            "watermark_persist_error": e.to_string(),
+                        })),
+                    },
+                    None => Some(serde_json::json!({
+                        "sync_key": key,
+                        "watermark_column": col,
+                        "warning": "watermark column not present in any row; no watermark recorded",
+                    })),
+                }
+            }
+            _ => None,
+        };
+
+        let mut body = serde_json::json!({
+            "ok": true,
+            "driver": driver.as_str(),
+            "triples_loaded": count,
+            "rows_processed": rows.len(),
+            "mapping_fields": mapping.mappings.len(),
+        });
+        if let Some(cdc) = cdc_summary {
+            body["cdc"] = cdc;
+        }
+        body.to_string()
+    }
+
+    #[tool(name = "onto_sql_sync_state", description = "Read the recorded CDC watermark for a sync_key. Returns {sync_key, last_watermark, watermark_column, last_synced_at, rows_synced, total_rows_lifetime} or null when no sync has been recorded yet. Pair with `onto_sql_ingest` — caller passes the watermark in their own WHERE clause; server tracks state.")]
+    async fn onto_sql_sync_state(&self, Parameters(input): Parameters<OntoSqlSyncStateInput>) -> String {
+        match crate::sql_sync::get_state(&self.db, &input.sync_key) {
+            Ok(Some(state)) => serde_json::to_string(&state)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Ok(None) => "null".to_string(),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_sql_sync_reset", description = "Clear the recorded CDC watermark for a sync_key. Returns {removed: true} if a state row was deleted, {removed: false} if no state existed. Use when resyncing from scratch.")]
+    async fn onto_sql_sync_reset(&self, Parameters(input): Parameters<OntoSqlSyncResetInput>) -> String {
+        match crate::sql_sync::reset_watermark(&self.db, &input.sync_key) {
+            Ok(removed) => format!(r#"{{"removed":{}}}"#, removed),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_sql_sync_states_list", description = "List every recorded CDC sync state across all sync_keys. Diagnostic helper.")]
+    async fn onto_sql_sync_states_list(&self) -> String {
+        match crate::sql_sync::list_states(&self.db) {
+            Ok(states) => serde_json::to_string(&states)
+                .unwrap_or_else(|e| Self::err_json(format!("serialization: {}", e))),
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_align", description = "Detect alignment candidates (owl:equivalentClass, skos:exactMatch, rdfs:subClassOf) between two ontologies or SKOS vocabularies (owl:Class and skos:Concept) using label similarity, property overlap, parent overlap, instance overlap, restriction patterns, and graph neighborhood. Confidence is the weighted mean over the signals that carry evidence for the pair (`scoring`: informative, or legacy for the published OAEI figures). `cardinality`: one-to-one or many-to-one. Ties are reported under `tied_with` and never auto-applied. Auto-applies high-confidence matches above threshold.")]
+    async fn onto_align(&self, Parameters(input): Parameters<OntoAlignInput>) -> String {
+        let engine = crate::align::AlignmentEngine::new(self.db.clone(), self.graph.clone());
+
+        // Read source (file path or inline)
+        let source = if std::path::Path::new(&input.source).exists() {
+            match std::fs::read_to_string(&input.source) {
+                Ok(s) => s,
+                Err(e) => return Self::err_json(format!("Failed to read source: {}", e)),
+            }
+        } else {
+            input.source
+        };
+
+        // Read target (file path, inline, or None)
+        let target = match input.target {
+            Some(t) => {
+                if std::path::Path::new(&t).exists() {
+                    match std::fs::read_to_string(&t) {
+                        Ok(s) => Some(s),
+                        Err(e) => return Self::err_json(format!("Failed to read target: {}", e)),
+                    }
+                } else {
+                    Some(t)
+                }
+            }
+            None => None,
+        };
+
+        let dry_run = input.dry_run.unwrap_or(false);
+        let fusion = input.fusion.as_deref().unwrap_or("weighted_sum");
+        let scoring = match crate::align::Scoring::parse(input.scoring.as_deref().unwrap_or("informative")) {
+            Ok(s) => s,
+            Err(e) => return Self::err_json(e),
+        };
+        let high = input
+            .high_threshold
+            .or(input.min_confidence)
+            .unwrap_or_else(|| scoring.default_high_threshold());
+        // Default low_threshold = 0.4 surfaces a borderline bucket for LLM-orchestrated review.
+        // Callers wanting the old strict behaviour pass low_threshold == high_threshold.
+        let low = input.low_threshold.unwrap_or(0.4).min(high);
+        let cardinality = match crate::align::Cardinality::parse(input.cardinality.as_deref().unwrap_or("one-to-one")) {
+            Ok(c) => c,
+            Err(e) => return Self::err_json(e),
+        };
+        let opts = crate::align::AlignOptions {
+            high_threshold: high,
+            low_threshold: low,
+            dry_run,
+            fusion: fusion.to_string(),
+            scoring,
+            cardinality,
+        };
+
+        match engine.align_with_options(&source, target.as_deref(), &opts) {
+            Ok(result) => {
+                self.lineage().record(
+                    &self.session_id,
+                    "AL",
+                    "align",
+                    &format!(
+                        "high={},low={},fusion={},scoring={},cardinality={}",
+                        high,
+                        low,
+                        fusion,
+                        scoring.as_str(),
+                        cardinality.as_str()
+                    ),
+                );
+                result
+            }
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_align_feedback", description = "Accept or reject an alignment candidate to improve future confidence scoring. Stores feedback in align_feedback table for self-calibrating weights.")]
+    async fn onto_align_feedback(&self, Parameters(input): Parameters<OntoAlignFeedbackInput>) -> String {
+        let engine = crate::align::AlignmentEngine::new(self.db.clone(), self.graph.clone());
+        match engine.record_feedback(&input.source_iri, &input.target_iri, "user_feedback", input.accepted, input.signals.as_ref()) {
+            Ok(result) => {
+                self.lineage().record(&self.session_id, "AF", "align_feedback", if input.accepted { "accepted" } else { "rejected" });
+                result
+            }
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_lint_feedback", description = "Accept or dismiss a lint issue to improve future lint runs. A warning or info is downgraded after 2 dismissals and suppressed after 3 (configurable in [feedback]); a suppressed issue moves to the suppressed[] list of the lint output with its rule, entity, original severity and dismissal count. Error-severity issues are never downgraded or suppressed. Stores feedback for self-calibrating severity.")]
+    async fn onto_lint_feedback(&self, Parameters(input): Parameters<OntoLintFeedbackInput>) -> String {
+        match crate::feedback::record_tool_feedback(&self.db, "lint", &input.rule_id, &input.entity, input.accepted) {
+            Ok(result) => {
+                self.lineage().record(&self.session_id, "LF", "lint_feedback", if input.accepted { "accepted" } else { "dismissed" });
+                result
+            }
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_enforce_feedback", description = "Accept or dismiss an enforce violation to improve future enforce runs. A warning or info is downgraded after 2 dismissals and suppressed after 3 (configurable in [feedback]); a suppressed violation moves to the suppressed[] list of the enforce output with its rule, entity, original severity and dismissal count. Error-severity violations are never downgraded or suppressed. Stores feedback for self-calibrating compliance.")]
+    async fn onto_enforce_feedback(&self, Parameters(input): Parameters<OntoEnforceFeedbackInput>) -> String {
+        match crate::feedback::record_tool_feedback(&self.db, "enforce", &input.rule_id, &input.entity, input.accepted) {
+            Ok(result) => {
+                self.lineage().record(&self.session_id, "EF", "enforce_feedback", if input.accepted { "accepted" } else { "dismissed" });
+                result
+            }
+            Err(e) => Self::err_json(e),
+        }
+    }
+
+    #[tool(name = "onto_embed", description = "Generate text + structural Poincaré embeddings for all classes in the loaded ontology. Requires a build with --features embeddings, plus the model (run `open-ontologies init` to download it). Embeddings enable semantic search via onto_search and improve alignment accuracy.")]
+    async fn onto_embed(&self, Parameters(input): Parameters<OntoEmbedInput>) -> String {
+        #[cfg(not(feature = "embeddings"))]
+        { let _ = input; return r#"{"error":"Compiled without embeddings feature. Rebuild with --features embeddings"}"#.to_string(); }
+        #[cfg(feature = "embeddings")]
+        {
+        let embedder = match &self.text_embedder {
+            Some(e) => e,
+            None => return r#"{"error":"Embedding model not loaded. Run `open-ontologies init` to download."}"#.to_string(),
+        };
+
+        let struct_dim = input.struct_dim.unwrap_or(32);
+        let struct_epochs = input.struct_epochs.unwrap_or(100);
+
+        let classes_query = r#"
+            SELECT DISTINCT ?class ?label WHERE {
+                ?class a <http://www.w3.org/2002/07/owl#Class> .
+                OPTIONAL { ?class <http://www.w3.org/2000/01/rdf-schema#label> ?label }
+                FILTER(isIRI(?class))
+            }
+        "#;
+
+        // Enumerating the store's classes is a question about the whole store,
+        // so read the union of all graphs, not the default graph alone.
+        let result = match self.graph.sparql_select_union(classes_query) {
+            Ok(r) => r,
+            Err(e) => return Self::err_json(e),
+        };
+
+        let parsed: serde_json::Value = match serde_json::from_str(&result) {
+            Ok(v) => v,
+            Err(e) => return Self::err_json(e),
+        };
+
+        let mut class_labels: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if let Some(rows) = parsed["results"].as_array() {
+            for row in rows {
+                if let Some(iri) = row["class"].as_str() {
+                    let iri = iri.trim_matches(|c| c == '<' || c == '>').to_string();
+                    let label = row["label"].as_str()
+                        .map(|s| s.trim_matches('"').to_string())
+                        .unwrap_or_else(|| {
+                            iri.rsplit_once('#').or_else(|| iri.rsplit_once('/'))
+                                .map(|(_, n)| n.to_string())
+                                .unwrap_or_else(|| iri.clone())
+                        });
+                    class_labels.insert(iri, label);
+                }
+            }
+        }
+
+        let trainer = crate::structembed::StructuralTrainer::new(struct_dim, struct_epochs, 0.01);
+        let struct_embeddings = match trainer.train(&self.graph) {
+            Ok(e) => e,
+            Err(e) => return Self::err_json(format!("structural training failed: {}", e)),
+        };
+
+        let mut embedded_count = 0;
+        let mut errors: Vec<String> = Vec::new();
+
+        let mut enriched_count: usize = 0;
+        for (iri, label) in &class_labels {
+            // GenOM-style enrichment: if the caller supplied a description for this
+            // IRI, embed THAT instead of the bare label. Descriptions carry richer
+            // semantic context (definition prose, synonyms, role in the ontology),
+            // which the GenOM paper showed lifts alignment F1 vs label-only embedding.
+            let (text_to_embed, used_description) = match input
+                .descriptions
+                .as_ref()
+                .and_then(|m| m.get(iri.as_str()))
+            {
+                Some(desc) if !desc.trim().is_empty() => (desc.as_str(), true),
+                _ => (label.as_str(), false),
+            };
+            // Compute the text embedding (may await an HTTP call) BEFORE
+            // locking the non-Send VecStore mutex.
+            match embedder.embed(text_to_embed).await {
+                Ok(text_vec) => {
+                    let struct_vec = struct_embeddings.get(iri)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0; struct_dim]);
+                    let mut vecstore = self.vecstore.lock().unwrap();
+                    vecstore.upsert(iri, &text_vec, &struct_vec);
+                    embedded_count += 1;
+                    if used_description {
+                        enriched_count += 1;
+                    }
+                }
+                Err(e) => errors.push(format!("{}: {}", iri, e)),
+            }
+        }
+
+        {
+            let vecstore = self.vecstore.lock().unwrap();
+            if let Err(e) = vecstore.persist() {
+                return Self::err_json(format!("failed to persist embeddings: {}", e));
+            }
+        }
+
+        serde_json::json!({
+            "ok": true,
+            "embedded": embedded_count,
+            "enriched": enriched_count,
+            "total_classes": class_labels.len(),
+            "text_dim": embedder.dim(),
+            "struct_dim": struct_dim,
+            "errors": errors,
+        }).to_string()
+        } // cfg(feature = "embeddings")
+    }
+
+    #[tool(name = "onto_hnsw_build", description = "Build (or rebuild) the HNSW cosine index over the loaded text embeddings with explicit `ef_construction` and `ef_search` parameters. Persists the index to SQLite by default so subsequent process restarts skip the rebuild. Use after onto_embed when you want to tune index quality vs. build/query time on larger ontologies. Default builder parameters are sensible for ontologies up to ~10k classes. Requires a build with --features embeddings.")]
+    async fn onto_hnsw_build(&self, Parameters(input): Parameters<OntoHnswBuildInput>) -> String {
+        #[cfg(not(feature = "embeddings"))]
+        { let _ = input; return r#"{"error":"Compiled without embeddings feature. Rebuild with --features embeddings"}"#.to_string(); }
+        #[cfg(feature = "embeddings")]
+        {
+            let persist = input.persist.unwrap_or(true);
+            let params = crate::hnsw_index::BuildParams {
+                ef_construction: input.ef_construction,
+                ef_search: input.ef_search,
+            };
+            let mut vecstore = self.vecstore.lock().unwrap();
+            vecstore.rebuild_cosine_index(params);
+            let count = vecstore.len();
+            let persisted = if persist {
+                match vecstore.persist_cosine_index() {
+                    Ok(()) => true,
+                    Err(e) => return Self::err_json(format!("persist failed: {}", e)),
+                }
+            } else {
+                false
+            };
+            serde_json::json!({
+                "ok": true,
+                "entries_indexed": count,
+                "persisted": persisted,
+                "ef_construction": input.ef_construction,
+                "ef_search": input.ef_search,
+            }).to_string()
+        }
+    }
+
+    #[tool(name = "onto_search", description = "Semantic search over the loaded ontology using natural language. Returns the most similar classes by text meaning, structural position, or both. Requires onto_embed to have been run first.")]
+    async fn onto_search(&self, Parameters(input): Parameters<OntoSearchInput>) -> String {
+        #[cfg(not(feature = "embeddings"))]
+        { let _ = input; return r#"{"error":"Compiled without embeddings feature. Rebuild with --features embeddings"}"#.to_string(); }
+        #[cfg(feature = "embeddings")]
+        {
+        let top_k = input.top_k.unwrap_or(10);
+        let mode = input.mode.as_deref().unwrap_or("product");
+        let alpha = input.alpha.unwrap_or(0.5);
+        let use_hnsw = input.use_hnsw.unwrap_or(false);
+        let ef_search_override = input.ef_search;
+
+        let embedder = match &self.text_embedder {
+            Some(e) => e,
+            None => return r#"{"error":"Embedding model not loaded."}"#.to_string(),
+        };
+
+        let query_vec = match embedder.embed(&input.query).await {
+            Ok(v) => v,
+            Err(e) => return Self::err_json(e),
+        };
+
+        let mut vecstore = self.vecstore.lock().unwrap();
+        if vecstore.is_empty() {
+            return r#"{"error":"No embeddings loaded. Run onto_embed first."}"#.to_string();
+        }
+
+        // If the caller provided an explicit ef_search, rebuild the cosine
+        // index with that value before the search. instant-distance bakes
+        // ef_search at build time, so per-query tuning means rebuild.
+        if use_hnsw && ef_search_override.is_some() {
+            let params = crate::hnsw_index::BuildParams {
+                ef_construction: None,
+                ef_search: ef_search_override,
+            };
+            vecstore.rebuild_cosine_index(params);
+        }
+
+        let results: Vec<serde_json::Value> = match mode {
+            "text" => {
+                let hits = if use_hnsw {
+                    vecstore.search_cosine_hnsw(&query_vec, top_k)
+                } else {
+                    vecstore.search_cosine(&query_vec, top_k)
+                };
+                hits.into_iter()
+                    .map(|(iri, score)| serde_json::json!({"iri": iri, "score": (score * 1000.0).round() / 1000.0}))
+                    .collect()
+            }
+            "structure" => {
+                let text_hits = vecstore.search_cosine(&query_vec, 1);
+                if let Some((anchor_iri, _)) = text_hits.first() {
+                    if let Some(struct_vec) = vecstore.get_struct_vec(anchor_iri) {
+                        vecstore.search_poincare(struct_vec, top_k)
+                            .into_iter()
+                            .map(|(iri, dist)| serde_json::json!({"iri": iri, "poincare_distance": (dist * 1000.0).round() / 1000.0}))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => {
+                let struct_dim = vecstore.search_cosine(&query_vec, 1)
+                    .first()
+                    .and_then(|(iri, _)| vecstore.get_struct_vec(iri).map(|v| v.len()))
+                    .unwrap_or(32);
+                let struct_query = vec![0.0f32; struct_dim];
+                vecstore.search_product(&query_vec, &struct_query, top_k, alpha)
+                    .into_iter()
+                    .map(|(iri, score)| serde_json::json!({"iri": iri, "score": (score * 1000.0).round() / 1000.0}))
+                    .collect()
+            }
+        };
+
+        serde_json::json!({
+            "results": results,
+            "query": input.query,
+            "mode": mode,
+            "count": results.len(),
+        }).to_string()
+        } // cfg(feature = "embeddings")
+    }
+
+    #[tool(name = "onto_similarity", description = "Compute embedding similarity between two IRIs — returns cosine similarity (text), Poincaré distance (structural), and product score.")]
+    async fn onto_similarity(&self, Parameters(input): Parameters<OntoSimilarityInput>) -> String {
+        #[cfg(not(feature = "embeddings"))]
+        { let _ = input; return r#"{"error":"Compiled without embeddings feature. Rebuild with --features embeddings"}"#.to_string(); }
+        #[cfg(feature = "embeddings")]
+        {
+        let vecstore = self.vecstore.lock().unwrap();
+
+        // Owned loads, so this works under text-vector eviction too.
+        let text_a = vecstore.load_text_vec(&input.iri_a);
+        let text_b = vecstore.load_text_vec(&input.iri_b);
+        let struct_a = vecstore.get_struct_vec(&input.iri_a);
+        let struct_b = vecstore.get_struct_vec(&input.iri_b);
+
+        if text_a.is_none() || text_b.is_none() {
+            return Self::err_json(format!("IRI not found in embeddings. Run onto_embed first. Missing: {}",
+                if text_a.is_none() { &input.iri_a } else { &input.iri_b }));
+        }
+
+        let cos = crate::poincare::cosine_similarity(&text_a.unwrap(), &text_b.unwrap());
+        let poinc = if let (Some(a), Some(b)) = (struct_a, struct_b) {
+            crate::poincare::poincare_distance(a, b)
+        } else {
+            -1.0
+        };
+
+        let product = if poinc >= 0.0 {
+            0.5 * cos + 0.5 / (1.0 + poinc)
+        } else {
+            cos
+        };
+
+        serde_json::json!({
+            "iri_a": input.iri_a,
+            "iri_b": input.iri_b,
+            "cosine_similarity": (cos * 1000.0).round() / 1000.0,
+            "poincare_distance": (poinc * 1000.0).round() / 1000.0,
+            "product_score": (product * 1000.0).round() / 1000.0,
+        }).to_string()
+        } // cfg(feature = "embeddings")
+    }
+}
+
+// ─── Prompt definitions ─────────────────────────────────────────────────────
+
+#[prompt_router]
+impl OpenOntologiesServer {
+    /// Build an ontology from a domain description. Guides through the full workflow: generate Turtle, validate, load, lint, query, and persist.
+    #[prompt(name = "build_ontology")]
+    fn build_ontology(&self, Parameters(input): Parameters<BuildOntologyInput>) -> Result<GetPromptResult, rmcp::ErrorData> {
+        let msg = format!(
+            "Build an OWL ontology for the following domain:\n\n{}\n\n\
+            Follow the Open Ontologies workflow:\n\
+            1. Generate Turtle/OWL directly\n\
+            2. Call onto_validate on the generated Turtle\n\
+            3. Call onto_load to load into the triple store\n\
+            4. Call onto_stats to verify counts\n\
+            5. Call onto_lint to check for missing labels, comments, domains, ranges\n\
+            6. Call onto_query with SPARQL to verify structure\n\
+            7. Fix any issues and iterate until clean\n\
+            8. Call onto_save to persist the final ontology",
+            input.domain
+        );
+        Ok(GetPromptResult::new(vec![
+            PromptMessage::new_text(PromptMessageRole::User, msg),
+        ]).with_description("Build an ontology from a domain description"))
+    }
+
+    /// Validate and lint an existing ontology file. Loads it, runs validation and lint checks, reports all issues.
+    #[prompt(name = "validate_ontology")]
+    fn validate_ontology(&self, Parameters(input): Parameters<ValidateOntologyInput>) -> Result<GetPromptResult, rmcp::ErrorData> {
+        let msg = format!(
+            "Validate and lint the ontology at: {}\n\n\
+            Steps:\n\
+            1. Call onto_validate to check syntax\n\
+            2. Call onto_load to load into the triple store\n\
+            3. Call onto_stats to show class/property/triple counts\n\
+            4. Call onto_lint to check for missing labels, domains, ranges\n\
+            5. Report all issues found and suggest fixes",
+            input.path
+        );
+        Ok(GetPromptResult::new(vec![
+            PromptMessage::new_text(PromptMessageRole::User, msg),
+        ]).with_description("Validate and lint an ontology file"))
+    }
+
+    /// Compare two versions of an ontology. Shows added/removed classes, properties, and drift analysis.
+    #[prompt(name = "compare_ontologies")]
+    fn compare_ontologies(&self, Parameters(input): Parameters<CompareOntologiesInput>) -> Result<GetPromptResult, rmcp::ErrorData> {
+        let msg = format!(
+            "Compare these two ontology versions:\n\
+            - Old: {}\n\
+            - New: {}\n\n\
+            Steps:\n\
+            1. Call onto_diff to see structural changes\n\
+            2. Call onto_drift to analyze drift velocity and detect renames\n\
+            3. Summarize: what was added, removed, renamed, and the overall risk",
+            input.old_path, input.new_path
+        );
+        Ok(GetPromptResult::new(vec![
+            PromptMessage::new_text(PromptMessageRole::User, msg),
+        ]).with_description("Compare two ontology versions"))
+    }
+
+    /// Ingest external data into a loaded ontology. Maps data fields to ontology classes/properties and validates with SHACL.
+    #[prompt(name = "ingest_data")]
+    fn ingest_data(&self, Parameters(input): Parameters<IngestDataInput>) -> Result<GetPromptResult, rmcp::ErrorData> {
+        let msg = format!(
+            "Ingest data from {} into the currently loaded ontology.\n\n\
+            Steps:\n\
+            1. Call onto_map to inspect the data and suggest a mapping\n\
+            2. Review and adjust the mapping\n\
+            3. Call onto_ingest with the mapping to generate RDF triples\n\
+            4. Call onto_stats to verify triple counts\n\
+            5. Call onto_shacl to validate against SHACL shapes\n\
+            6. Call onto_reason to infer additional triples\n\
+            7. Call onto_query to verify the ingested data",
+            input.data_path
+        );
+        Ok(GetPromptResult::new(vec![
+            PromptMessage::new_text(PromptMessageRole::User, msg),
+        ]).with_description("Ingest external data into a loaded ontology"))
+    }
+
+    /// Align two ontologies using hybrid neuro-symbolic matching. Runs structural alignment first, then asks you (the LLM) to adjudicate uncertain pairs.
+    #[prompt(name = "align_ontologies")]
+    fn align_ontologies(&self, Parameters(input): Parameters<AlignOntologiesInput>) -> Result<GetPromptResult, rmcp::ErrorData> {
+        let msg = format!(
+            "Align these two ontologies using hybrid neuro-symbolic matching:\n\
+            - Source: {}\n\
+            - Target: {}\n\n\
+            Follow this pipeline:\n\n\
+            **Step 1: Structural alignment**\n\
+            Call onto_align with source, target, min_confidence=0.7, dry_run=true.\n\
+            This returns candidates with confidence scores and signal breakdowns.\n\n\
+            **Step 2: Auto-accept high-confidence matches**\n\
+            Candidates with confidence >= 0.95 are reliable. List them as accepted.\n\n\
+            **Step 3: LLM adjudication of uncertain pairs**\n\
+            For candidates with confidence 0.7-0.95, YOU decide:\n\
+            - Look at the source and target labels, their parent classes, and the signal breakdown\n\
+            - Use your knowledge of the domain to judge if they refer to the same concept\n\
+            - Accept the pair if they are genuinely equivalent; reject if they are false matches\n\
+            - Example: \"levator auris longus\" (mouse muscle) <-> \"Auricularis\" (human muscle) = ACCEPT (same ear muscle, different species names)\n\
+            - Example: \"tail\" <-> \"Tail_of_Pancreas\" = REJECT (different concepts despite shared word)\n\n\
+            **Step 4: Apply accepted matches**\n\
+            For each accepted pair (both auto-accepted and LLM-adjudicated), call onto_align_feedback with accepted=true.\n\
+            For rejected pairs, call onto_align_feedback with accepted=false.\n\
+            This trains the self-calibrating weights for future alignments.\n\n\
+            **Step 5: Report**\n\
+            Summarize: total candidates, auto-accepted, LLM-accepted, LLM-rejected, and final alignment count.",
+            input.source_path, input.target_path
+        );
+        Ok(GetPromptResult::new(vec![
+            PromptMessage::new_text(PromptMessageRole::User, msg),
+        ]).with_description("Align two ontologies using hybrid neuro-symbolic matching (structural + LLM adjudication)"))
+    }
+
+    /// Explore a loaded ontology with SPARQL. Lists classes, properties, and answers competency questions.
+    #[prompt(name = "explore_ontology")]
+    fn explore_ontology(&self) -> Result<GetPromptResult, rmcp::ErrorData> {
+        Ok(GetPromptResult::new(vec![
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                "Explore the currently loaded ontology:\n\n\
+                1. Call onto_stats to show overview counts\n\
+                2. Call onto_query to list all classes with labels\n\
+                3. Call onto_query to show the class hierarchy (subClassOf)\n\
+                4. Call onto_query to list all properties with domains and ranges\n\
+                5. Summarize the ontology structure and suggest competency questions it can answer",
+            ),
+        ]).with_description("Explore a loaded ontology with SPARQL"))
+    }
+}
+
+// ─── ServerHandler ──────────────────────────────────────────────────────────
+
+#[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
+impl ServerHandler for OpenOntologiesServer {
+    /// The instructions string states the count it MEASURES.
+    ///
+    /// It used to state two, 114 and 112, neither of which was the number the
+    /// router advertised, and the second sentence promised that the eight
+    /// feature-gated tools were advertised and would "return an error without
+    /// it". They are not advertised any more, so the sentence is now about
+    /// what is missing and why, and both numbers are read off the router the
+    /// client is about to call.
+    fn get_info(&self) -> ServerInfo {
+        let advertised = self.tool_router.list_all().len();
+        let withheld = crate::toolfilter::unavailable_in_this_build();
+        let tail = if withheld.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {} further tools are compiled in but NOT advertised, because this build \
+                 lacks the Cargo feature each one needs and a tool that is guaranteed to fail \
+                 should not appear in tools/list: {}. Rebuild with the feature to get them.",
+                withheld.len(),
+                crate::toolfilter::FEATURE_GATED_TOOLS
+                    .iter()
+                    .filter(|(t, _)| withheld.contains(t))
+                    .map(|(t, f)| format!("{t} (--features {f})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        // Telling a client it has every tool while advertising one profile's
+        // worth is a false claim to the one reader that cannot check.
+        let s = &*self.tool_surface;
+        let profile_tail = if s.withheld_by_filter > 0 {
+            format!(
+                " This server is running the \"{}\" tool profile, so {} of the {} tools this \
+                 build can serve are NOT advertised. Call onto_status for the profile and the \
+                 counts; the operator can select another profile or \"full\".",
+                s.profile, s.withheld_by_filter, s.servable_in_this_build
+            )
+        } else {
+            String::new()
+        };
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_prompts().build())
+            .with_instructions(format!(
+                "Open Ontologies: AI-native ontology engine, an RDF/OWL/SPARQL MCP server with \
+                 {advertised} tools and 6 workflow prompts for ontology engineering, validation, \
+                 comparison, alignment, data ingestion, and exploration.{tail}{profile_tail}"
+            ))
+    }
+}
